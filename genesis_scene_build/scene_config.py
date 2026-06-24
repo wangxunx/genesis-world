@@ -38,6 +38,42 @@ FRANKA_KV = (450, 450, 350, 350, 200, 200, 200, 10, 10)
 FRANKA_FORCE_MIN = (-87, -87, -87, -87, -12, -12, -12, -100, -100)
 FRANKA_FORCE_MAX = (87, 87, 87, 87, 12, 12, 12, 100, 100)
 
+# == Cameras ==
+# World camera: a fixed third-person view of the tabletop. Intrinsics are matched to
+# the Intel RealSense D435i RGB (color) module, same as the wrist camera: FOV
+# 69 deg (H) x 42 deg (V) at native 16:9. Using vfov = 42 deg at 1280x720 gives
+# H-FOV ~= 68.6 deg and intrinsics fx = fy ~= 938 px, cx = 640, cy = 360. Only the
+# extrinsics (pos / lookat) differ from the wrist camera.
+WORLD_CAM_RES = (1280, 720)
+WORLD_CAM_POS = (TABLE_CENTER[0] + 1.0, -1.2, 1.5)
+WORLD_CAM_LOOKAT = (TABLE_CENTER[0], TABLE_CENTER[1], TABLE_TOP_Z)
+WORLD_CAM_FOV = 42  # vertical FOV in degrees (D435i RGB module)
+
+# Wrist camera: mounted on the Franka hand link (eye-in-hand), looking toward the
+# grasp area. Parameters are matched to a real Intel RealSense D435i.
+#
+# Genesis derives a simple pinhole intrinsic purely from (resolution, vertical FOV):
+#     fx = fy = 0.5 * height / tan(vfov / 2),  cx = width / 2,  cy = height / 2
+# so matching D435i means picking the right resolution aspect ratio + vertical FOV.
+#
+# Used as an RGB-only camera (depth channel ignored), matched to the D435i *color*
+# module spec: FOV 69 deg (H) x 42 deg (V), native 16:9 sensor.
+# Using vfov = 42 deg at 1280x720 reproduces the horizontal FOV automatically:
+#     H-FOV = 2 * atan((1280/720) * tan(21 deg)) ~= 68.6 deg  (~= 69 deg).
+# Resulting intrinsics @ 1280x720: fx = fy ~= 938 px, cx = 640, cy = 360,
+# which closely matches a real D435i color stream at this resolution.
+WRIST_CAM_RES = (1280, 720)
+WRIST_CAM_FOV = 42  # vertical FOV in degrees (D435i RGB module)
+WRIST_CAM_LINK = "hand"
+# Camera pose relative to the hand link frame. On the Franka, the hand link +z
+# points along the gripper approach direction (toward the fingertips). The camera's
+# optical axis is its local -z, so a 180 deg rotation about x makes -z align with
+# the hand +z, i.e. the camera looks forward along the approach direction. The
+# position offset sits the camera slightly behind the hand origin so the fingers
+# stay in view.
+WRIST_CAM_OFFSET_POS = (0.05, 0.0, -0.03)
+WRIST_CAM_OFFSET_EULER = (180.0, 0.0, 0.0)
+
 
 @dataclass(frozen=True)
 class YCBAsset:

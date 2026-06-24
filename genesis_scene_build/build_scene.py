@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 import genesis as gs
+from genesis.utils.geom import trans_R_to_T, euler_to_R
 
 from scene_config import (
     ASSETS,
@@ -30,10 +32,45 @@ from scene_config import (
     TABLE_LEG_SIZE,
     TABLE_TOP_SIZE,
     TABLE_TOP_Z,
+    WORLD_CAM_FOV,
+    WORLD_CAM_LOOKAT,
+    WORLD_CAM_POS,
+    WORLD_CAM_RES,
+    WRIST_CAM_FOV,
+    WRIST_CAM_LINK,
+    WRIST_CAM_OFFSET_EULER,
+    WRIST_CAM_OFFSET_POS,
+    WRIST_CAM_RES,
     YCB_LAYOUT,
     get_ycb_assets,
 )
 from setup_assets import setup_assets
+
+
+@dataclass
+class SceneBundle:
+    """Everything a caller needs to drive and observe the scene."""
+
+    scene: gs.Scene
+    franka: gs.RigidEntity
+    ycb: dict[str, gs.RigidEntity]
+    world_cam: "gs.vis.camera.Camera | None" = None
+    wrist_cam: "gs.vis.camera.Camera | None" = None
+    _wrist_link: "gs.RigidLink | None" = None
+
+    def update_wrist_cam(self) -> None:
+        """Sync the wrist camera to the current hand-link pose. Call each step."""
+        if self.wrist_cam is not None:
+            self.wrist_cam.move_to_attach()
+
+    def render(self, *, rgb: bool = True, depth: bool = False):
+        """Render both cameras (if present). Returns a dict keyed by camera name."""
+        out = {}
+        if self.world_cam is not None:
+            out["world"] = self.world_cam.render(rgb=rgb, depth=depth)
+        if self.wrist_cam is not None:
+            out["wrist"] = self.wrist_cam.render(rgb=rgb, depth=depth)
+        return out
 
 
 def _ensure_assets() -> Path:
@@ -77,8 +114,9 @@ def build_scene(
     *,
     show_viewer: bool = False,
     n_envs: int = 1,
-    add_camera: bool = False,
-) -> tuple[gs.Scene, gs.RigidEntity, dict[str, gs.RigidEntity]]:
+    add_world_cam: bool = True,
+    add_wrist_cam: bool = True,
+) -> SceneBundle:
     assets = _ensure_assets()
     ycb_assets = get_ycb_assets()
 
@@ -131,15 +169,26 @@ def build_scene(
         ),
     )
 
-    camera = None
-    if add_camera:
-        camera = scene.add_camera(
-            res=(960, 720),
-            pos=(cx + 1.0, -1.2, 1.5),
-            lookat=camera_lookat,
-            fov=45,
+    # Cameras must be added before scene.build().
+    world_cam = None
+    if add_world_cam:
+        world_cam = scene.add_camera(
+            res=WORLD_CAM_RES,
+            pos=WORLD_CAM_POS,
+            lookat=WORLD_CAM_LOOKAT,
+            fov=WORLD_CAM_FOV,
             GUI=False,
         )
+
+    wrist_cam = None
+    wrist_link = None
+    if add_wrist_cam:
+        wrist_cam = scene.add_camera(
+            res=WRIST_CAM_RES,
+            fov=WRIST_CAM_FOV,
+            GUI=False,
+        )
+        wrist_link = franka.get_link(WRIST_CAM_LINK)
 
     if n_envs > 1:
         scene.build(n_envs=n_envs, env_spacing=(1.5, 1.5))
@@ -147,9 +196,24 @@ def build_scene(
         scene.build()
 
     configure_franka(franka, n_envs=n_envs)
-    if add_camera:
-        return scene, franka, ycb_entities, camera
-    return scene, franka, ycb_entities
+
+    # Attaching needs the link's runtime pose, so it happens after build().
+    if wrist_cam is not None:
+        offset_T = trans_R_to_T(
+            np.asarray(WRIST_CAM_OFFSET_POS, dtype=np.float64),
+            euler_to_R(np.asarray(WRIST_CAM_OFFSET_EULER, dtype=np.float64)),
+        )
+        wrist_cam.attach(wrist_link, offset_T)
+        wrist_cam.move_to_attach()
+
+    return SceneBundle(
+        scene=scene,
+        franka=franka,
+        ycb=ycb_entities,
+        world_cam=world_cam,
+        wrist_cam=wrist_cam,
+        _wrist_link=wrist_link,
+    )
 
 
 def configure_franka(franka: gs.RigidEntity, *, n_envs: int) -> None:
@@ -173,13 +237,25 @@ def main() -> None:
         action="store_true",
         help="Refresh YCB and robot symlinks before building.",
     )
+    parser.add_argument("--no-world-cam", action="store_true", help="Disable the fixed world camera.")
+    parser.add_argument("--no-wrist-cam", action="store_true", help="Disable the wrist camera.")
+    parser.add_argument(
+        "--save-frames",
+        action="store_true",
+        help="Render and save one frame from each camera at the end of the run.",
+    )
     args = parser.parse_args()
 
     if args.setup_assets:
         setup_assets()
 
     gs.init(backend=gs.cpu if args.cpu else gs.gpu)
-    scene, franka, _ = build_scene(show_viewer=args.vis, n_envs=args.n_envs)
+    bundle = build_scene(
+        show_viewer=args.vis,
+        n_envs=args.n_envs,
+        add_world_cam=not args.no_world_cam,
+        add_wrist_cam=not args.no_wrist_cam,
+    )
 
     # Keep the arm at its initial pose so it does not droop under gravity.
     hold_qpos = np.array(FRANKA_QPOS)
@@ -187,8 +263,19 @@ def main() -> None:
         hold_qpos = np.tile(hold_qpos, (args.n_envs, 1))
 
     for _ in range(args.steps):
-        franka.control_dofs_position(hold_qpos)
-        scene.step()
+        bundle.franka.control_dofs_position(hold_qpos)
+        bundle.scene.step()
+        bundle.update_wrist_cam()
+
+    if args.save_frames:
+        import imageio.v2 as imageio
+
+        if bundle.world_cam is not None:
+            imageio.imwrite("world_cam.png", bundle.world_cam.render(rgb=True)[0])
+            print("Saved world_cam.png")
+        if bundle.wrist_cam is not None:
+            imageio.imwrite("wrist_cam.png", bundle.wrist_cam.render(rgb=True)[0])
+            print("Saved wrist_cam.png")
 
 
 if __name__ == "__main__":
