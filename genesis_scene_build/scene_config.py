@@ -45,7 +45,13 @@ FRANKA_FORCE_MAX = (87, 87, 87, 87, 12, 12, 12, 100, 100)
 # H-FOV ~= 68.6 deg and intrinsics fx = fy ~= 938 px, cx = 640, cy = 360. Only the
 # extrinsics (pos / lookat) differ from the wrist camera.
 WORLD_CAM_RES = (1280, 720)
-WORLD_CAM_POS = (TABLE_CENTER[0] + 1.0, -1.2, 1.5)
+# Placed 1 m directly above the table corner closest to the viewer (+x, -y corner).
+#   x = 0.35 + 1.20/2 = 0.95,  y = 0.0 - 0.80/2 = -0.40,  z = 0.75 + 1.0 = 1.75
+WORLD_CAM_POS = (
+    TABLE_CENTER[0] + TABLE_TOP_SIZE[0] / 2,
+    TABLE_CENTER[1] - TABLE_TOP_SIZE[1] / 2,
+    TABLE_TOP_Z + 1.0,
+)
 WORLD_CAM_LOOKAT = (TABLE_CENTER[0], TABLE_CENTER[1], TABLE_TOP_Z)
 WORLD_CAM_FOV = 42  # vertical FOV in degrees (D435i RGB module)
 
