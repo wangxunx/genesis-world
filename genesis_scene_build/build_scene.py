@@ -116,6 +116,7 @@ def build_scene(
     n_envs: int = 1,
     add_world_cam: bool = True,
     add_wrist_cam: bool = True,
+    draw_world_frame: bool = False,
 ) -> SceneBundle:
     assets = _ensure_assets()
     ycb_assets = get_ycb_assets()
@@ -206,6 +207,10 @@ def build_scene(
         wrist_cam.attach(wrist_link, offset_T)
         wrist_cam.move_to_attach()
 
+    # Debug world frame at the origin (X=red, Y=green, Z=blue) to help tune layout.
+    if draw_world_frame:
+        scene.draw_debug_frame(T=np.eye(4), axis_length=0.3, origin_size=0.02, axis_radius=0.01)
+
     return SceneBundle(
         scene=scene,
         franka=franka,
@@ -240,6 +245,11 @@ def main() -> None:
     parser.add_argument("--no-world-cam", action="store_true", help="Disable the fixed world camera.")
     parser.add_argument("--no-wrist-cam", action="store_true", help="Disable the wrist camera.")
     parser.add_argument(
+        "--debug-frame",
+        action="store_true",
+        help="Draw a world coordinate frame at the origin for layout debugging.",
+    )
+    parser.add_argument(
         "--save-frames",
         action="store_true",
         help="Render and save one frame from each camera at the end of the run.",
@@ -255,6 +265,7 @@ def main() -> None:
         n_envs=args.n_envs,
         add_world_cam=not args.no_world_cam,
         add_wrist_cam=not args.no_wrist_cam,
+        draw_world_frame=args.debug_frame,
     )
 
     # Keep the arm at its initial pose so it does not droop under gravity.
