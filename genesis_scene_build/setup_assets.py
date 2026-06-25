@@ -11,7 +11,7 @@ FRANKA_SOURCE = ROOT.parent / "genesis" / "assets" / "xml" / "franka_emika_panda
 
 YCB_OBJECTS = (
     "003_cracker_box",
-    "006_mustard_bottle",
+    # "006_mustard_bottle",
     "011_banana",
     "024_bowl",
     "025_mug",

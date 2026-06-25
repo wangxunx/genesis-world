@@ -26,7 +26,7 @@ FRANKA_EULER = (0.0, 0.0, 0.0)
 # == YCB object xy positions on the tabletop (z filled in at build time) ==
 YCB_LAYOUT = {
     "003_cracker_box": {"pos": (0.28, -0.18, 0.0), "euler": (0.0, 0.0, 15.0)},
-    "006_mustard_bottle": {"pos": (0.42, 0.04, 0.0), "euler": (0.0, 0.0, -20.0)},
+    # "006_mustard_bottle": {"pos": (0.42, 0.04, 0.0), "euler": (0.0, 0.0, -20.0)},
     "011_banana": {"pos": (0.30, 0.20, 0.0), "euler": (0.0, 0.0, 35.0)},
     "024_bowl": {"pos": (0.52, -0.08, 0.0), "euler": (0.0, 0.0, 0.0)},
     "025_mug": {"pos": (0.22, 0.10, 0.0), "euler": (0.0, 0.0, 10.0)},
