@@ -159,7 +159,7 @@ def build_scene(
                 convexify=True,
                 decimate_face_num=500,
             ),
-            material=gs.materials.Rigid(rho=300.0),
+            material=gs.materials.Rigid(rho=300.0, friction=layout.get("friction")),
         )
 
     franka = scene.add_entity(

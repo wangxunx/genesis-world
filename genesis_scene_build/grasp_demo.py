@@ -57,7 +57,7 @@ class GraspProfile:
 
     yaw_offset: float = 90.0  # deg added to the object yaw to orient the jaws
     grasp_hand_z: float = TABLE_TOP_Z + 0.105  # absolute hand-link z at grasp
-    close_force: float = -10.0  # N, finger force-control while grasping
+    close_force: float = -10.0  # N, finger force-control while holding the grasp
 
 
 # Defaults are tuned for the banana; other objects fall back to DEFAULT_PROFILE
@@ -65,6 +65,9 @@ class GraspProfile:
 DEFAULT_PROFILE = GraspProfile()
 GRASP_PROFILES: dict[str, GraspProfile] = {
     "011_banana": GraspProfile(yaw_offset=90.0, grasp_hand_z=TABLE_TOP_Z + 0.105, close_force=-10.0),
+    # Fruits are scaled to ~5.4 cm (see scale_ycb.py); grasp near their equator.
+    "013_apple": GraspProfile(yaw_offset=0.0, grasp_hand_z=TABLE_TOP_Z + 0.10, close_force=-12.0),
+    "017_orange": GraspProfile(yaw_offset=0.0, grasp_hand_z=TABLE_TOP_Z + 0.12, close_force=-12.0),
     "025_mug": GraspProfile(yaw_offset=0.0, grasp_hand_z=TABLE_TOP_Z + 0.085, close_force=-12.0),
     "006_mustard_bottle": GraspProfile(yaw_offset=0.0, grasp_hand_z=TABLE_TOP_Z + 0.11, close_force=-12.0),
 }
@@ -141,6 +144,27 @@ def _goto_direct(bundle, pos, quat, *, finger_cmd, steps=120, close_force=None):
     return qpos
 
 
+def _descend_vertical(bundle, xy, z_from, z_to, quat, *, finger, steps=80, settle=15):
+    """Descend straight down along a fixed xy by interpolating z and re-solving IK.
+
+    A single IK snap can swing the hand laterally mid-descent; for tight clearances
+    (e.g. a sphere nearly as wide as the gripper) that sideways sweep grazes and rolls
+    the object away. Stepping z keeps the hand on a vertical line.
+    """
+    qpos = None
+    for z in np.linspace(z_from, z_to, steps):
+        qpos = _ik(bundle, np.array([xy[0], xy[1], z]), quat)
+        qpos[-2:] = finger
+        bundle.franka.control_dofs_position(qpos)
+        bundle.scene.step()
+        bundle.update_wrist_cam()
+    for _ in range(settle):
+        bundle.franka.control_dofs_position(qpos)
+        bundle.scene.step()
+        bundle.update_wrist_cam()
+    return qpos
+
+
 def _resolve_place(bundle, place_target: PlaceTarget) -> tuple[np.ndarray, float, object]:
     """Return (target_xy, reference_z, target_entity_or_None) for a place target."""
     if isinstance(place_target, str):
@@ -174,17 +198,19 @@ def run_pick_place(bundle, task: TaskSpec, *, save_frames: bool = False):
     _goto_plan(bundle, pregrasp, grasp_quat, finger=GRIPPER_OPEN)
     snap("01_pregrasp")
 
-    # 2) Descend to grasp height.
+    # 2) Descend straight down to grasp height (vertical path avoids grazing the object).
+    _descend_vertical(
+        bundle, (obj_pos[0], obj_pos[1]), pregrasp[2], profile.grasp_hand_z, grasp_quat, finger=GRIPPER_OPEN
+    )
     grasp = np.array([obj_pos[0], obj_pos[1], profile.grasp_hand_z])
-    _goto_direct(bundle, grasp, grasp_quat, finger_cmd=GRIPPER_OPEN, steps=100)
     snap("02_reach")
 
     # 3) Close the gripper with force control.
     _goto_direct(bundle, grasp, grasp_quat, finger_cmd=0.0, steps=100, close_force=profile.close_force)
     snap("03_grasp")
 
-    # 4) Lift.
-    lift = np.array([obj_pos[0], obj_pos[1], LIFT_HAND_Z])
+    # 4) Lift straight up from the grasp xy.
+    lift = np.array([grasp[0], grasp[1], LIFT_HAND_Z])
     _goto_direct(bundle, lift, grasp_quat, finger_cmd=0.0, steps=100, close_force=profile.close_force)
     snap("04_lift")
 

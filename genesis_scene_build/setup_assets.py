@@ -7,15 +7,23 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 ASSETS = ROOT / "assets"
 YCB_SOURCE = ROOT.parent / "mani_skill_dataset"
+# Scaled-down copies (see scale_ycb.py). Near-spherical fruits are baked smaller so a
+# parallel-jaw gripper (8 cm max opening) can grasp them with comfortable clearance.
+YCB_SCALED_SOURCE = ROOT.parent / "mani_skill_dataset_scaled"
 FRANKA_SOURCE = ROOT.parent / "genesis" / "assets" / "xml" / "franka_emika_panda"
 
 YCB_OBJECTS = (
-    "003_cracker_box",
+    # "003_cracker_box",
     # "006_mustard_bottle",
     "011_banana",
+    "013_apple",
+    "017_orange",
     "024_bowl",
     "025_mug",
 )
+
+# Objects sourced from the scaled dataset instead of the original YCB dataset.
+YCB_SCALED_OBJECTS = frozenset({"013_apple", "017_orange"})
 
 
 def _symlink(src: Path, dst: Path) -> None:
@@ -35,7 +43,8 @@ def setup_assets() -> Path:
     robot_dir = ASSETS / "robots" / "franka"
 
     for name in YCB_OBJECTS:
-        src = YCB_SOURCE / name
+        source_root = YCB_SCALED_SOURCE if name in YCB_SCALED_OBJECTS else YCB_SOURCE
+        src = source_root / name
         if not src.is_dir():
             raise FileNotFoundError(f"Missing YCB asset directory: {src}")
         _symlink(src, ycb_dir / name)
