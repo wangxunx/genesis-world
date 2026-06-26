@@ -17,7 +17,10 @@ YCB_OBJECTS = (
     # "006_mustard_bottle",
     "011_banana",
     "013_apple",
+    "014_lemon",
+    "016_pear",
     "017_orange",
+    "018_plum",
     "024_bowl",
     "025_mug",
 )

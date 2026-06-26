@@ -34,6 +34,15 @@ YCB_LAYOUT = {
     # pickable pool for data collection until a better grasp strategy exists.
     "013_apple": {"pos": (0.45, 0.28, 0.0), "euler": (0.0, 0.0, 0.0), "friction": 1.0},
     "017_orange": {"pos": (0.45, -0.22, 0.0), "euler": (0.0, 0.0, 0.0), "friction": 1.0},
+    # Real-scale fruits (no scaling needed -- they already fit the gripper).
+    # lemon: small oblate ellipsoid -> reliably graspable (verified 6/6). In pickable pool.
+    "014_lemon": {"pos": (0.33, 0.00, 0.0), "euler": (0.0, 0.0, 0.0), "friction": 1.0},
+    # pear: elongated but its cross-section is round (~6.6 cm), so parallel jaws slip on
+    # it during lift just like a sphere -- NOT reliably graspable. Kept as a scene
+    # distractor; exclude from the pickable pool.
+    "016_pear": {"pos": (0.35, -0.13, 0.0), "euler": (0.0, 0.0, 90.0), "friction": 1.0},
+    # plum: small near-sphere (~5.3 cm) -> reliably graspable (verified 5/5). In pickable pool.
+    "018_plum": {"pos": (0.40, 0.05, 0.0), "euler": (0.0, 0.0, 0.0), "friction": 1.0},
     "024_bowl": {"pos": (0.52, -0.08, 0.0), "euler": (0.0, 0.0, 0.0)},
     "025_mug": {"pos": (0.22, 0.10, 0.0), "euler": (0.0, 0.0, 10.0)},
 }
