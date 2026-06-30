@@ -65,7 +65,8 @@ class GraspProfile:
 DEFAULT_PROFILE = GraspProfile()
 GRASP_PROFILES: dict[str, GraspProfile] = {
     "011_banana": GraspProfile(yaw_offset=90.0, grasp_hand_z=TABLE_TOP_Z + 0.105, close_force=-10.0),
-    # Fruits are scaled to ~5.4 cm (see scale_ycb.py); grasp near their equator.
+    # apple/orange: large smooth spheres (~7.5 cm, original scale) -- only marginally
+    # graspable (excluded from the reliable pickable pool); profiles kept for completeness.
     "013_apple": GraspProfile(yaw_offset=0.0, grasp_hand_z=TABLE_TOP_Z + 0.10, close_force=-12.0),
     "017_orange": GraspProfile(yaw_offset=0.0, grasp_hand_z=TABLE_TOP_Z + 0.12, close_force=-12.0),
     # lemon: small oblate ellipsoid, grasped near its equator -- reliable (verified 6/6).

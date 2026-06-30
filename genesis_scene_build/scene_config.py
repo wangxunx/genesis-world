@@ -28,10 +28,9 @@ YCB_LAYOUT = {
     # "003_cracker_box": {"pos": (0.28, -0.18, 0.0), "euler": (0.0, 0.0, 15.0)},
     # "006_mustard_bottle": {"pos": (0.42, 0.04, 0.0), "euler": (0.0, 0.0, -20.0)},
     "011_banana": {"pos": (0.30, 0.20, 0.0), "euler": (0.0, 0.0, 35.0)},
-    # Scaled-down (see scale_ycb.py) so they fit the gripper; friction ~1.0 matches a
-    # silicone pad on fruit skin. NOTE: smooth spheres are only marginally graspable by
-    # parallel jaws (flaky at realistic friction) -- keep them out of the reliable
-    # pickable pool for data collection until a better grasp strategy exists.
+    # apple/orange: large smooth spheres (~7.5 cm, original scale). Near the gripper's
+    # 8 cm limit and only marginally graspable (flaky at realistic friction) -- kept as
+    # scene distractors, excluded from the reliable pickable pool.
     "013_apple": {"pos": (0.45, 0.28, 0.0), "euler": (0.0, 0.0, 0.0), "friction": 1.0},
     "017_orange": {"pos": (0.45, -0.22, 0.0), "euler": (0.0, 0.0, 0.0), "friction": 1.0},
     # Real-scale fruits (no scaling needed -- they already fit the gripper).
