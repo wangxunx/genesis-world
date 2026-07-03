@@ -24,26 +24,32 @@ FRANKA_POS = (-0.10, 0.0, TABLE_TOP_Z)
 FRANKA_EULER = (0.0, 0.0, 0.0)
 
 # == YCB object xy positions on the tabletop (z filled in at build time) ==
+# Minimal pick-and-place set for pipeline development: three reliably reachable pick
+# objects plus one place container. Objects that are not reliably graspable by the
+# scripted parallel-jaw pick (apple, orange, pear, mug) and the earlier distractors
+# (cracker_box, mustard_bottle) are disabled to reduce clutter and grasp-time
+# collisions. Re-enable them later (e.g. as M4 distractors) by uncommenting.
 YCB_LAYOUT = {
+    # -- disabled distractors / hard-to-grasp objects --
     # "003_cracker_box": {"pos": (0.28, -0.18, 0.0), "euler": (0.0, 0.0, 15.0)},
     # "006_mustard_bottle": {"pos": (0.42, 0.04, 0.0), "euler": (0.0, 0.0, -20.0)},
-    "011_banana": {"pos": (0.30, 0.20, 0.0), "euler": (0.0, 0.0, 35.0)},
-    # apple/orange: large smooth spheres (~7.5 cm, original scale). Near the gripper's
-    # 8 cm limit and only marginally graspable (flaky at realistic friction) -- kept as
-    # scene distractors, excluded from the reliable pickable pool.
-    "013_apple": {"pos": (0.45, 0.28, 0.0), "euler": (0.0, 0.0, 0.0), "friction": 1.0},
-    "017_orange": {"pos": (0.45, -0.22, 0.0), "euler": (0.0, 0.0, 0.0), "friction": 1.0},
-    # Real-scale fruits (no scaling needed -- they already fit the gripper).
-    # lemon: small oblate ellipsoid -> reliably graspable (verified 6/6). In pickable pool.
-    "014_lemon": {"pos": (0.33, 0.00, 0.0), "euler": (0.0, 0.0, 0.0), "friction": 1.0},
-    # pear: elongated but its cross-section is round (~6.6 cm), so parallel jaws slip on
-    # it during lift just like a sphere -- NOT reliably graspable. Kept as a scene
-    # distractor; exclude from the pickable pool.
-    "016_pear": {"pos": (0.35, -0.13, 0.0), "euler": (0.0, 0.0, 90.0), "friction": 1.0},
-    # plum: small near-sphere (~5.3 cm) -> reliably graspable (verified 5/5). In pickable pool.
-    "018_plum": {"pos": (0.40, 0.05, 0.0), "euler": (0.0, 0.0, 0.0), "friction": 1.0},
-    "024_bowl": {"pos": (0.52, -0.08, 0.0), "euler": (0.0, 0.0, 0.0)},
-    "025_mug": {"pos": (0.22, 0.10, 0.0), "euler": (0.0, 0.0, 10.0)},
+    # apple/orange: large smooth spheres (~7.5 cm) -- only marginally graspable (flaky at
+    # realistic friction) and near the gripper's 8 cm limit.
+    # "013_apple": {"pos": (0.45, 0.28, 0.0), "euler": (0.0, 0.0, 0.0), "friction": 1.0},
+    # "017_orange": {"pos": (0.45, -0.22, 0.0), "euler": (0.0, 0.0, 0.0), "friction": 1.0},
+    # pear: round cross-section (~6.6 cm) makes parallel jaws slip on lift -- not reliable.
+    # "016_pear": {"pos": (0.35, -0.13, 0.0), "euler": (0.0, 0.0, 90.0), "friction": 1.0},
+    # mug: currently fails the scripted grasp (thin walls / handle) -- disabled for now.
+    # "025_mug": {"pos": (0.22, 0.10, 0.0), "euler": (0.0, 0.0, 10.0)},
+    # -- active pick objects (spread apart to reduce grasp-time collisions and give the
+    #    M2 randomizer some position-jitter room) --
+    "011_banana": {"pos": (0.31, 0.22, 0.0), "euler": (0.0, 0.0, 35.0)},
+    # lemon: small oblate ellipsoid; grasped near its equator. In pickable pool.
+    "014_lemon": {"pos": (0.34, -0.08, 0.0), "euler": (0.0, 0.0, 0.0), "friction": 1.0},
+    # plum: small near-sphere (~5.3 cm); grasped near its equator. In pickable pool.
+    "018_plum": {"pos": (0.44, 0.08, 0.0), "euler": (0.0, 0.0, 0.0), "friction": 1.0},
+    # -- place container --
+    "024_bowl": {"pos": (0.50, -0.10, 0.0), "euler": (0.0, 0.0, 0.0)},
 }
 
 # == Reachable workspace on the tabletop (empirically verified grasp region) ==
