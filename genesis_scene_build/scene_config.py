@@ -46,6 +46,12 @@ YCB_LAYOUT = {
     "025_mug": {"pos": (0.22, 0.10, 0.0), "euler": (0.0, 0.0, 10.0)},
 }
 
+# == Reachable workspace on the tabletop (empirically verified grasp region) ==
+# Objects sampled outside this box tend to be unreachable (IK fails) or drift off the
+# tuned grasp region. Used by the M2 randomizer to clamp jittered object poses.
+REACH_X = (0.30, 0.50)
+REACH_Y = (-0.22, 0.28)
+
 FRANKA_QPOS = (0.0, -0.3, 0.0, -2.0, 0.0, 1.7, 0.79, 0.04, 0.04)
 FRANKA_KP = (4500, 4500, 3500, 3500, 2000, 2000, 2000, 100, 100)
 FRANKA_KV = (450, 450, 350, 350, 200, 200, 200, 10, 10)
@@ -100,12 +106,23 @@ class YCBAsset:
     name: str
     mesh_path: Path
     collision_path: Path
-    rest_z_offset: float
+    rest_z_offset: float  # z distance from mesh origin to its lowest point (m)
+    radius_xy: float  # circumscribed radius of the mesh's xy footprint (m)
 
 
-def _mesh_rest_z_offset(mesh_path: Path) -> float:
+def _mesh_geometry(mesh_path: Path) -> tuple[float, float]:
+    """Return (rest_z_offset, radius_xy) from a mesh's axis-aligned bounds.
+
+    radius_xy is the circumscribed radius of the xy bounding box (half its diagonal),
+    a rotation-safe upper bound on the footprint used for non-overlap spacing.
+    """
     mesh = trimesh.load(mesh_path, force="mesh")
-    return float(-mesh.bounds[0][2])
+    lower, upper = mesh.bounds
+    rest_z_offset = float(-lower[2])
+    dx = float(upper[0] - lower[0])
+    dy = float(upper[1] - lower[1])
+    radius_xy = 0.5 * float((dx**2 + dy**2) ** 0.5)
+    return rest_z_offset, radius_xy
 
 
 def get_ycb_assets() -> dict[str, YCBAsset]:
@@ -113,10 +130,12 @@ def get_ycb_assets() -> dict[str, YCBAsset]:
     for name in YCB_LAYOUT:
         mesh_path = ASSETS / "ycb" / name / "textured.obj"
         collision_path = ASSETS / "ycb" / name / "collision.ply"
+        rest_z_offset, radius_xy = _mesh_geometry(mesh_path)
         assets[name] = YCBAsset(
             name=name,
             mesh_path=mesh_path,
             collision_path=collision_path,
-            rest_z_offset=_mesh_rest_z_offset(mesh_path),
+            rest_z_offset=rest_z_offset,
+            radius_xy=radius_xy,
         )
     return assets
