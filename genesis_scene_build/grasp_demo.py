@@ -93,14 +93,23 @@ class TaskSpec:
         return GRASP_PROFILES.get(self.pick_object, DEFAULT_PROFILE)
 
 
+def _to_numpy(x) -> np.ndarray:
+    """Convert a value to a 1-D numpy array, handling GPU torch tensors."""
+    if hasattr(x, "detach"):
+        x = x.detach().cpu().numpy()
+    return np.asarray(x).reshape(-1)
+
+
 def _topdown_quat(yaw_deg: float) -> np.ndarray:
     """Top-down grasp orientation with an extra yaw about world z."""
     return euler_to_quat(np.array([180.0, 0.0, yaw_deg]))
 
 
-def _settle(bundle, steps: int) -> None:
+def _settle(bundle, steps: int, recorder=None) -> None:
     hold = np.array(FRANKA_QPOS)
     for _ in range(steps):
+        if recorder is not None:
+            recorder.on_step(hold)
         bundle.franka.control_dofs_position(hold)
         bundle.scene.step()
         bundle.update_wrist_cam()
@@ -118,30 +127,41 @@ def _ik(bundle, pos: np.ndarray, quat: np.ndarray) -> np.ndarray:
     return bundle.franka.inverse_kinematics(link=hand, pos=pos, quat=quat)
 
 
-def _goto_plan(bundle, pos, quat, *, finger, num_waypoints=150, settle=20):
+def _goto_plan(bundle, pos, quat, *, finger, num_waypoints=150, settle=20, recorder=None):
     """Plan a collision-free path to (pos, quat) and execute it."""
     qpos = _ik(bundle, pos, quat)
     qpos[-2:] = finger
     path = bundle.franka.plan_path(qpos_goal=qpos, num_waypoints=num_waypoints)
     for wp in path:
+        if recorder is not None:
+            recorder.on_step(wp)
         bundle.franka.control_dofs_position(wp)
         bundle.scene.step()
         bundle.update_wrist_cam()
     for _ in range(settle):
+        if recorder is not None:
+            recorder.on_step(qpos)
         bundle.franka.control_dofs_position(qpos)
         bundle.scene.step()
         bundle.update_wrist_cam()
     return qpos
 
 
-def _goto_direct(bundle, pos, quat, *, finger_cmd, steps=120, close_force=None):
+def _goto_direct(bundle, pos, quat, *, finger_cmd, steps=120, close_force=None, recorder=None):
     """Move arm via direct position control (no planning), holding gripper command.
 
     If `close_force` is given, the fingers are force-controlled (grasping); otherwise
     they are position-controlled to `finger_cmd`.
     """
     qpos = _ik(bundle, pos, quat)
+    # For a joint-position action space, record the intended finger target: closed (0.0)
+    # while force-grasping, otherwise the commanded finger position.
+    finger_target = 0.0 if close_force is not None else finger_cmd
+    arm = _to_numpy(qpos[:-2])
+    action = np.concatenate([arm, [finger_target, finger_target]])
     for _ in range(steps):
+        if recorder is not None:
+            recorder.on_step(action)
         bundle.franka.control_dofs_position(qpos[:-2], MOTORS_DOF)
         if close_force is not None:
             bundle.franka.control_dofs_force(np.array([close_force, close_force]), FINGERS_DOF)
@@ -152,7 +172,7 @@ def _goto_direct(bundle, pos, quat, *, finger_cmd, steps=120, close_force=None):
     return qpos
 
 
-def _descend_vertical(bundle, xy, z_from, z_to, quat, *, finger, steps=80, settle=15):
+def _descend_vertical(bundle, xy, z_from, z_to, quat, *, finger, steps=80, settle=15, recorder=None):
     """Descend straight down along a fixed xy by interpolating z and re-solving IK.
 
     A single IK snap can swing the hand laterally mid-descent; for tight clearances
@@ -163,10 +183,14 @@ def _descend_vertical(bundle, xy, z_from, z_to, quat, *, finger, steps=80, settl
     for z in np.linspace(z_from, z_to, steps):
         qpos = _ik(bundle, np.array([xy[0], xy[1], z]), quat)
         qpos[-2:] = finger
+        if recorder is not None:
+            recorder.on_step(qpos)
         bundle.franka.control_dofs_position(qpos)
         bundle.scene.step()
         bundle.update_wrist_cam()
     for _ in range(settle):
+        if recorder is not None:
+            recorder.on_step(qpos)
         bundle.franka.control_dofs_position(qpos)
         bundle.scene.step()
         bundle.update_wrist_cam()
@@ -183,7 +207,7 @@ def _resolve_place(bundle, place_target: PlaceTarget) -> tuple[np.ndarray, float
     return np.array([float(x), float(y)]), TABLE_TOP_Z, None
 
 
-def run_pick_place(bundle, task: TaskSpec, *, save_frames: bool = False):
+def run_pick_place(bundle, task: TaskSpec, *, save_frames: bool = False, recorder=None):
     pick_entity = bundle.ycb[task.pick_object]
     profile = task.grasp_profile()
 
@@ -193,7 +217,7 @@ def run_pick_place(bundle, task: TaskSpec, *, save_frames: bool = False):
         if save_frames and bundle.world_cam is not None:
             frames.append((tag, bundle.world_cam.render(rgb=True)[0]))
 
-    # Let objects settle on the table.
+    # Let objects settle on the table. Not recorded: keeps episodes focused on motion.
     _settle(bundle, 60)
     snap("00_start")
 
@@ -203,39 +227,40 @@ def run_pick_place(bundle, task: TaskSpec, *, save_frames: bool = False):
 
     # 1) Pre-grasp above the object, gripper open.
     pregrasp = np.array([obj_pos[0], obj_pos[1], obj_pos[2] + PREGRASP_CLEARANCE])
-    _goto_plan(bundle, pregrasp, grasp_quat, finger=GRIPPER_OPEN)
+    _goto_plan(bundle, pregrasp, grasp_quat, finger=GRIPPER_OPEN, recorder=recorder)
     snap("01_pregrasp")
 
     # 2) Descend straight down to grasp height (vertical path avoids grazing the object).
     _descend_vertical(
-        bundle, (obj_pos[0], obj_pos[1]), pregrasp[2], profile.grasp_hand_z, grasp_quat, finger=GRIPPER_OPEN
+        bundle, (obj_pos[0], obj_pos[1]), pregrasp[2], profile.grasp_hand_z, grasp_quat,
+        finger=GRIPPER_OPEN, recorder=recorder,
     )
     grasp = np.array([obj_pos[0], obj_pos[1], profile.grasp_hand_z])
     snap("02_reach")
 
     # 3) Close the gripper with force control.
-    _goto_direct(bundle, grasp, grasp_quat, finger_cmd=0.0, steps=100, close_force=profile.close_force)
+    _goto_direct(bundle, grasp, grasp_quat, finger_cmd=0.0, steps=100, close_force=profile.close_force, recorder=recorder)
     snap("03_grasp")
 
     # 4) Lift straight up from the grasp xy.
     lift = np.array([grasp[0], grasp[1], LIFT_HAND_Z])
-    _goto_direct(bundle, lift, grasp_quat, finger_cmd=0.0, steps=100, close_force=profile.close_force)
+    _goto_direct(bundle, lift, grasp_quat, finger_cmd=0.0, steps=100, close_force=profile.close_force, recorder=recorder)
     snap("04_lift")
 
     # 5) Move above the place target.
     place_xy, place_ref_z, _ = _resolve_place(bundle, task.place_target)
     above = np.array([place_xy[0], place_xy[1], place_ref_z + PLACE_HAND_Z_ABOVE_TARGET])
-    _goto_direct(bundle, above, grasp_quat, finger_cmd=0.0, steps=120, close_force=profile.close_force)
+    _goto_direct(bundle, above, grasp_quat, finger_cmd=0.0, steps=120, close_force=profile.close_force, recorder=recorder)
     snap("05_above_target")
 
     # 6) Release the object.
-    _goto_direct(bundle, above, grasp_quat, finger_cmd=GRIPPER_OPEN, steps=80)
+    _goto_direct(bundle, above, grasp_quat, finger_cmd=GRIPPER_OPEN, steps=80, recorder=recorder)
     snap("06_release")
 
     # 7) Retreat upward and let the object settle.
     retreat = np.array([place_xy[0], place_xy[1], RETREAT_HAND_Z])
-    _goto_direct(bundle, retreat, grasp_quat, finger_cmd=GRIPPER_OPEN, steps=80)
-    _settle(bundle, 60)
+    _goto_direct(bundle, retreat, grasp_quat, finger_cmd=GRIPPER_OPEN, steps=80, recorder=recorder)
+    _settle(bundle, 60, recorder=recorder)
     snap("07_done")
 
     success = check_success(bundle, task)

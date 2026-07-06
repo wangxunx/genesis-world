@@ -1,0 +1,241 @@
+"""M3: record scripted pick-and-place episodes into a LeRobotDataset.
+
+Runs the M2-randomized scene with the scripted banana pick-and-place, captures
+(observation.state, action, camera images) per timestep, and writes only the
+*successful* episodes into a LeRobotDataset (lerobot 0.4.x API).
+
+Defaults (per project decision):
+  - action space : 9-D joint positions (7 arm + 2 gripper), the commanded targets
+  - cameras      : world + wrist RGB
+  - fps          : 30 (decimated from the 100 Hz sim by capturing ~every 3.33 steps)
+  - success only : failed episodes are discarded
+
+Usage:
+    uv run python genesis_scene_build/record_dataset.py --cpu --episodes 10
+    # then inspect: it writes to genesis_scene_build/datasets/<name>/
+"""
+
+from __future__ import annotations
+
+import argparse
+import shutil
+import sys
+from pathlib import Path
+
+import cv2
+import numpy as np
+
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+import genesis as gs
+from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+from build_scene import build_scene
+from grasp_demo import TaskSpec, run_pick_place
+from randomize import EnvRandomizer, RandomizationConfig
+
+# The sim runs at dt=0.01 (see build_scene): 100 control steps per second.
+CONTROL_FPS = 100
+
+JOINT_NAMES = [
+    "panda_joint1", "panda_joint2", "panda_joint3", "panda_joint4",
+    "panda_joint5", "panda_joint6", "panda_joint7",
+    "panda_finger_joint1", "panda_finger_joint2",
+]
+
+# Human-readable names for the natural-language task string (per episode).
+OBJECT_DISPLAY_NAMES = {
+    "011_banana": "banana",
+    "014_lemon": "lemon",
+    "018_plum": "plum",
+    "013_apple": "apple",
+    "017_orange": "orange",
+    "016_pear": "pear",
+    "025_mug": "mug",
+}
+
+
+def task_description(pick_object: str) -> str:
+    name = OBJECT_DISPLAY_NAMES.get(pick_object, pick_object)
+    return f"pick the {name} and place it in the bowl"
+
+
+class EpisodeRecorder:
+    """Buffers per-timestep (state, action, images) for one episode at a target fps.
+
+    Frames are held in memory and only committed to the dataset if the episode
+    succeeds, so failed attempts leave no partial data behind. Capture is decimated
+    from the sim's control rate to `fps` via a fractional-step accumulator.
+    """
+
+    def __init__(self, bundle, *, fps: int, img_wh: tuple[int, int], control_fps: int = CONTROL_FPS):
+        self.bundle = bundle
+        self.fps = fps
+        self.img_w, self.img_h = img_wh
+        self.steps_per_frame = control_fps / fps
+        self.reset()
+
+    def reset(self) -> None:
+        self.states: list[np.ndarray] = []
+        self.actions: list[np.ndarray] = []
+        self.world_imgs: list[np.ndarray] = []
+        self.wrist_imgs: list[np.ndarray] = []
+        # Preload so the very first step is captured (motion onset).
+        self._accum = self.steps_per_frame
+
+    def __len__(self) -> int:
+        return len(self.states)
+
+    @staticmethod
+    def _to_np(x) -> np.ndarray:
+        if hasattr(x, "detach"):
+            x = x.detach().cpu().numpy()
+        return np.asarray(x)
+
+    def _resize(self, img) -> np.ndarray:
+        img = self._to_np(img)
+        if (img.shape[1], img.shape[0]) != (self.img_w, self.img_h):
+            img = cv2.resize(img, (self.img_w, self.img_h), interpolation=cv2.INTER_AREA)
+        return np.ascontiguousarray(img, dtype=np.uint8)
+
+    def on_step(self, action) -> None:
+        """Called once per sim control step with the 9-D commanded joint target."""
+        self._accum += 1.0
+        if self._accum < self.steps_per_frame:
+            return
+        self._accum -= self.steps_per_frame
+
+        state = self._to_np(self.bundle.franka.get_qpos()).reshape(-1).astype(np.float32)
+        action = self._to_np(action).reshape(-1).astype(np.float32)
+        world = self._resize(self.bundle.world_cam.render(rgb=True)[0])
+        wrist = self._resize(self.bundle.wrist_cam.render(rgb=True)[0])
+
+        self.states.append(state)
+        self.actions.append(action)
+        self.world_imgs.append(world)
+        self.wrist_imgs.append(wrist)
+
+    def flush_to(self, dataset: LeRobotDataset, task: str) -> None:
+        """Write the buffered frames into the dataset as one episode."""
+        for state, action, world, wrist in zip(self.states, self.actions, self.world_imgs, self.wrist_imgs):
+            dataset.add_frame(
+                {
+                    "observation.state": state,
+                    "action": action,
+                    "observation.images.world": world,
+                    "observation.images.wrist": wrist,
+                    "task": task,
+                }
+            )
+        dataset.save_episode()
+
+
+def build_features(img_wh: tuple[int, int]) -> dict:
+    w, h = img_wh
+    vec = {"dtype": "float32", "shape": (len(JOINT_NAMES),), "names": JOINT_NAMES}
+    img = {"dtype": "video", "shape": (h, w, 3), "names": ["height", "width", "channel"]}
+    return {
+        "observation.state": dict(vec),
+        "action": dict(vec),
+        "observation.images.world": dict(img),
+        "observation.images.wrist": dict(img),
+    }
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Record scripted pick-and-place into a LeRobotDataset.")
+    parser.add_argument("-c", "--cpu", action="store_true", default=False)
+    parser.add_argument("-v", "--vis", action="store_true", default=False)
+    parser.add_argument("--episodes", type=int, default=10, help="Number of SUCCESSFUL episodes to record.")
+    parser.add_argument("--max-attempts", type=int, default=0, help="Cap on total attempts (0 = 5x episodes).")
+    parser.add_argument("--seed", type=int, default=0, help="Base RNG seed.")
+    parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--img-width", type=int, default=640)
+    parser.add_argument("--img-height", type=int, default=360)
+    parser.add_argument(
+        "--pick",
+        nargs="+",
+        default=["011_banana"],
+        help="Object(s) to pick. Give one (e.g. 014_lemon) or several "
+        "(e.g. 011_banana 014_lemon 018_plum) to record a mixed dataset; "
+        "one is sampled per episode.",
+    )
+    parser.add_argument("--repo-id", default="genesis/banana_pick")
+    parser.add_argument("--root", default=None, help="Output dir (default: datasets/<repo-name>).")
+    parser.add_argument("--vcodec", default="libsvtav1")
+    parser.add_argument("--overwrite", action="store_true", help="Delete an existing dataset dir first.")
+    parser.add_argument(
+        "--keep-failures",
+        action="store_true",
+        help="Debug: also save failed episodes (task label prefixed with 'FAILED: ') "
+        "so you can inspect failure modes in the videos.",
+    )
+    args = parser.parse_args()
+
+    img_wh = (args.img_width, args.img_height)
+    root = Path(args.root) if args.root else _ROOT / "datasets" / args.repo_id.split("/")[-1]
+    if root.exists():
+        if args.overwrite:
+            shutil.rmtree(root)
+        else:
+            raise SystemExit(f"[record] {root} already exists. Use --overwrite or pass a new --root.")
+
+    max_attempts = args.max_attempts if args.max_attempts > 0 else args.episodes * 5
+
+    gs.init(backend=gs.cpu if args.cpu else gs.gpu)
+    bundle = build_scene(show_viewer=args.vis, n_envs=1, add_world_cam=True, add_wrist_cam=True)
+
+    dataset = LeRobotDataset.create(
+        repo_id=args.repo_id,
+        fps=args.fps,
+        features=build_features(img_wh),
+        root=root,
+        robot_type="franka",
+        use_videos=True,
+        vcodec=args.vcodec,
+    )
+
+    # Randomize object poses each episode. The pick object is sampled here (not by the
+    # randomizer) so we can restrict it to the requested --pick list and set a matching
+    # per-episode task string.
+    randomizer = EnvRandomizer(bundle, RandomizationConfig(randomize_pick=False, seed=args.seed))
+    recorder = EpisodeRecorder(bundle, fps=args.fps, img_wh=img_wh)
+    pick_rng = np.random.default_rng(args.seed)
+    pick_choices = list(args.pick)
+
+    n_success = 0
+    n_failed_saved = 0
+    attempts = 0
+    while n_success < args.episodes and attempts < max_attempts:
+        episode_seed = args.seed + attempts
+        randomizer.reset(seed=episode_seed)
+        pick_object = str(pick_rng.choice(pick_choices))
+        task = TaskSpec(pick_object=pick_object, place_target="024_bowl")
+
+        recorder.reset()
+        success, _ = run_pick_place(bundle, task, recorder=recorder)
+        attempts += 1
+
+        if success and len(recorder) > 0:
+            recorder.flush_to(dataset, task_description(pick_object))
+            n_success += 1
+            print(f"[record] episode {n_success}/{args.episodes} saved "
+                  f"(attempt {attempts}, seed {episode_seed}, pick={pick_object}, {len(recorder)} frames)")
+        elif args.keep_failures and len(recorder) > 0:
+            recorder.flush_to(dataset, "FAILED: " + task_description(pick_object))
+            n_failed_saved += 1
+            print(f"[record] attempt {attempts} (seed {episode_seed}, pick={pick_object}) "
+                  f"failed -> saved for debug ({len(recorder)} frames)")
+        else:
+            print(f"[record] attempt {attempts} (seed {episode_seed}, pick={pick_object}) failed -> discarded")
+
+    dataset.finalize()
+    print(f"[record] done: {n_success} success"
+          + (f" + {n_failed_saved} failed (debug)" if args.keep_failures else "")
+          + f" in {attempts} attempts -> {root}")
+
+
+if __name__ == "__main__":
+    main()
