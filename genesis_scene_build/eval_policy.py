@@ -1,0 +1,454 @@
+"""M5: policy-agnostic closed-loop evaluation of a trained lerobot policy.
+
+Runs a trained policy (ACT, SmolVLA, or any other lerobot policy) in the same
+Genesis pick-and-place scene used for recording, and reports the success rate.
+
+The script is deliberately *policy-agnostic*: it never hard-codes ACT- or
+SmolVLA-specific logic. Instead it relies on lerobot's generic interfaces, and
+is organized as a few thin layers:
+
+  1. Policy layer   -- load any checkpoint via ``PreTrainedConfig`` + ``make_policy``
+                       + ``make_pre_post_processors``. The only per-policy detail
+                       (normalization, image resize, temporal ensembling, language
+                       conditioning) lives inside the loaded processors/policy.
+  2. Observation    -- ``build_observation`` reads the sim into the exact feature
+     layer            keys the dataset used (state + camera images), as raw numpy.
+                       ``predict_action`` (lerobot) then converts/normalizes them.
+  3. Action layer   -- the policy emits the dataset's action vector (9-D joint
+                       targets); ``apply_action`` position-controls the arm+gripper.
+  4. Rollout layer  -- ``run_episode`` steps the sim, decimating the 100 Hz control
+                       loop down to the policy's fps, and checks task success.
+
+The dataset the policy was trained on is used only to recover feature shapes,
+normalization stats and fps (via ``LeRobotDatasetMetadata``); no episodes are read.
+
+Usage:
+    uv run python genesis_scene_build/eval_policy.py \
+        --policy-path outputs/train/act_banana/checkpoints/last/pretrained_model \
+        --repo-id genesis/banana_pick \
+        --dataset-root genesis_scene_build/datasets/banana_pick \
+        --episodes 20 --pick 011_banana
+
+    # SmolVLA is identical -- only the checkpoint changes:
+    uv run python genesis_scene_build/eval_policy.py \
+        --policy-path outputs/train/smolvla_banana/checkpoints/last/pretrained_model \
+        --repo-id genesis/banana_pick --dataset-root .../banana_pick --episodes 20
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime
+from pathlib import Path
+
+import cv2
+import numpy as np
+import torch
+
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+import genesis as gs
+from lerobot.configs.policies import PreTrainedConfig
+from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
+from lerobot.policies.factory import make_policy, make_pre_post_processors
+from lerobot.utils.control_utils import predict_action
+from lerobot.utils.utils import get_safe_torch_device
+
+from build_scene import build_scene
+from grasp_demo import TaskSpec, check_success
+from randomize import EnvRandomizer, RandomizationConfig
+from record_dataset import CONTROL_FPS, task_description
+
+STATE_KEY = "observation.state"
+
+
+@dataclass
+class PolicyBundle:
+    """A loaded policy plus everything needed to run inference on it."""
+
+    policy: object
+    preprocessor: object
+    postprocessor: object
+    device: torch.device
+    fps: int
+    image_keys: list[str]
+    image_hw: tuple[int, int]  # (height, width) the dataset stored images at
+    use_amp: bool = False
+    policy_type: str = "unknown"
+
+    def reset(self) -> None:
+        self.policy.reset()
+
+    def select_action(self, observation: dict[str, np.ndarray], task: str | None) -> np.ndarray:
+        """Run one inference step; returns the action as a 1-D numpy array."""
+        action = predict_action(
+            observation,
+            self.policy,
+            self.device,
+            self.preprocessor,
+            self.postprocessor,
+            use_amp=self.use_amp,
+            task=task,
+            robot_type="franka",
+        )
+        return action.detach().cpu().numpy().reshape(-1).astype(np.float32)
+
+
+def load_policy(
+    policy_path: str,
+    repo_id: str,
+    dataset_root: str | None,
+    device_str: str,
+    *,
+    use_amp: bool = False,
+) -> PolicyBundle:
+    """Generically load any lerobot policy checkpoint for closed-loop inference.
+
+    ``dataset_root`` points at the *local* dataset the policy was trained on; its
+    metadata supplies feature shapes, normalization stats and fps. This keeps the
+    eval consistent with training without re-reading any episode data.
+    """
+    device = get_safe_torch_device(device_str, log=True)
+
+    ds_meta = LeRobotDatasetMetadata(repo_id, root=dataset_root)
+
+    cfg = PreTrainedConfig.from_pretrained(policy_path)
+    cfg.pretrained_path = policy_path
+    cfg.device = str(device)
+
+    policy = make_policy(cfg=cfg, ds_meta=ds_meta)
+    policy.eval()
+
+    preprocessor, postprocessor = make_pre_post_processors(
+        policy_cfg=cfg,
+        pretrained_path=policy_path,
+        preprocessor_overrides={"device_processor": {"device": str(device)}},
+    )
+
+    image_keys = [k for k in ds_meta.features if k.startswith("observation.images")]
+    if not image_keys:
+        raise RuntimeError(f"No image features found in dataset {repo_id!r}.")
+    h, w, _ = ds_meta.features[image_keys[0]]["shape"]
+
+    print(
+        f"[eval] loaded {cfg.type} policy from {policy_path}\n"
+        f"       device={device} fps={ds_meta.fps} images={image_keys} @ {w}x{h}"
+    )
+    return PolicyBundle(
+        policy=policy,
+        preprocessor=preprocessor,
+        postprocessor=postprocessor,
+        device=device,
+        fps=ds_meta.fps,
+        image_keys=image_keys,
+        image_hw=(h, w),
+        use_amp=use_amp,
+        policy_type=cfg.type,
+    )
+
+
+def _to_np(x) -> np.ndarray:
+    if hasattr(x, "detach"):
+        x = x.detach().cpu().numpy()
+    return np.asarray(x)
+
+
+def _render_camera(cam, size_wh: tuple[int, int]) -> np.ndarray:
+    img = _to_np(cam.render(rgb=True)[0])
+    w, h = size_wh
+    if (img.shape[1], img.shape[0]) != (w, h):
+        img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+    return np.ascontiguousarray(img, dtype=np.uint8)
+
+
+def build_observation(bundle, pb: PolicyBundle) -> dict[str, np.ndarray]:
+    """Read the current sim state into the dataset's raw feature layout (numpy).
+
+    Images are returned HWC uint8 and the state is a float32 vector -- exactly the
+    format ``predict_action`` expects before it tensorizes / normalizes them.
+    """
+    h, w = pb.image_hw
+    obs: dict[str, np.ndarray] = {
+        STATE_KEY: _to_np(bundle.franka.get_qpos()).reshape(-1).astype(np.float32),
+    }
+    cam_for_key = {
+        "observation.images.world": bundle.world_cam,
+        "observation.images.wrist": bundle.wrist_cam,
+    }
+    for key in pb.image_keys:
+        cam = cam_for_key.get(key)
+        if cam is None:
+            raise RuntimeError(f"Dataset expects camera {key!r} but the scene has no such camera.")
+        obs[key] = _render_camera(cam, (w, h))
+    return obs
+
+
+def apply_action(bundle, action: np.ndarray, n_sim_steps: int) -> None:
+    """Position-control the arm+gripper to the policy's target for ``n_sim_steps``."""
+    action = np.asarray(action, dtype=np.float64).reshape(-1)
+    for _ in range(n_sim_steps):
+        bundle.franka.control_dofs_position(action)
+        bundle.scene.step()
+        bundle.update_wrist_cam()
+
+
+@dataclass
+class EpisodeResult:
+    success: bool
+    frames: list[np.ndarray] = field(default_factory=list)
+    n_policy_steps: int = 0
+
+
+def run_episode(
+    bundle,
+    pb: PolicyBundle,
+    task: TaskSpec,
+    *,
+    task_text: str | None,
+    max_seconds: float,
+    record_video: bool = False,
+) -> EpisodeResult:
+    """Run one closed-loop rollout and return whether the task succeeded.
+
+    The policy is queried at ``pb.fps``; between queries the commanded action is
+    held while the sim advances at ``CONTROL_FPS``. A fractional accumulator keeps
+    the average control:policy step ratio exact (e.g. 100/30).
+    """
+    pb.reset()
+
+    steps_per_frame = CONTROL_FPS / pb.fps
+    max_frames = int(round(max_seconds * pb.fps))
+
+    result = EpisodeResult(success=False)
+    accum = 0.0
+    for _ in range(max_frames):
+        obs = build_observation(bundle, pb)
+        if record_video:
+            result.frames.append(obs[pb.image_keys[0]].copy())
+
+        action = pb.select_action(obs, task_text)
+
+        accum += steps_per_frame
+        n_sub = int(accum)
+        accum -= n_sub
+        apply_action(bundle, action, max(1, n_sub))
+        result.n_policy_steps += 1
+
+        # Early stop once the object is in the bowl and settled.
+        if check_success(bundle, task):
+            result.success = True
+            break
+
+    if not result.success:
+        result.success = check_success(bundle, task)
+    return result
+
+
+def _save_video(frames: list[np.ndarray], path: Path, fps: int) -> None:
+    if not frames:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    h, w = frames[0].shape[:2]
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
+    for f in frames:
+        writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
+    writer.release()
+
+
+def evaluate_policy(
+    bundle,
+    pb: PolicyBundle,
+    *,
+    episodes: int,
+    seed: int = 1000,
+    max_seconds: float = 15.0,
+    pick: list[str] | tuple[str, ...] = ("011_banana",),
+    place: str = "024_bowl",
+    tol: float = 0.08,
+    no_task: bool = False,
+    jitter: float = 0.03,
+    randomizer: EnvRandomizer | None = None,
+    save_video: bool = False,
+    video_dir: Path | None = None,
+    label: str = "",
+) -> dict:
+    """Run ``episodes`` closed-loop rollouts and return a structured results dict.
+
+    The episode initial conditions are fully determined by ``seed`` (per-episode
+    ``randomizer.reset(seed=seed+ep)`` + a ``seed``-seeded pick sampler), so calling
+    this with the same ``seed``/``jitter``/``pick`` on different checkpoints evaluates
+    every policy on *identical* initial conditions -- the basis for fair comparison.
+    """
+    if randomizer is None:
+        randomizer = EnvRandomizer(
+            bundle, RandomizationConfig(pos_jitter=jitter, randomize_pick=False, seed=seed)
+        )
+    pick_rng = np.random.default_rng(seed)
+    pick_choices = list(pick)
+    prefix = f"[eval:{label}]" if label else "[eval]"
+
+    n_success = 0
+    per_object: dict[str, list[int]] = {}
+    episodes_detail: list[dict] = []
+    for ep in range(episodes):
+        episode_seed = seed + ep
+        randomizer.reset(seed=episode_seed)
+        pick_object = str(pick_rng.choice(pick_choices))
+        task = TaskSpec(pick_object=pick_object, place_target=place, success_tol=tol)
+        task_text = None if no_task else task_description(pick_object)
+
+        result = run_episode(
+            bundle, pb, task,
+            task_text=task_text,
+            max_seconds=max_seconds,
+            record_video=save_video,
+        )
+        n_success += int(result.success)
+        per_object.setdefault(pick_object, []).append(int(result.success))
+        episodes_detail.append(
+            {
+                "ep": ep,
+                "seed": episode_seed,
+                "pick": pick_object,
+                "steps": result.n_policy_steps,
+                "success": bool(result.success),
+            }
+        )
+
+        if save_video and video_dir is not None:
+            tag = "success" if result.success else "fail"
+            _save_video(result.frames, Path(video_dir) / f"ep{ep:03d}_{pick_object}_{tag}.mp4", pb.fps)
+
+        print(
+            f"{prefix} ep {ep:03d} seed={episode_seed} pick={pick_object} "
+            f"steps={result.n_policy_steps} -> success={result.success}"
+        )
+
+    rate = n_success / max(1, episodes)
+    print(f"{prefix} success rate: {n_success}/{episodes} = {rate:.1%}")
+    per_object_summary = {
+        obj: {"n": len(hits), "success": int(sum(hits)), "rate": sum(hits) / len(hits)}
+        for obj, hits in sorted(per_object.items())
+    }
+    if len(per_object_summary) > 1:
+        for obj, s in per_object_summary.items():
+            print(f"{prefix}   {obj}: {s['success']}/{s['n']} = {s['rate']:.1%}")
+
+    return {
+        "episodes": episodes,
+        "n_success": n_success,
+        "success_rate": rate,
+        "per_object": per_object_summary,
+        "episodes_detail": episodes_detail,
+        "params": {
+            "seed": seed,
+            "max_seconds": max_seconds,
+            "pick": list(pick_choices),
+            "place": place,
+            "tol": tol,
+            "no_task": no_task,
+            "jitter": jitter,
+        },
+    }
+
+
+def checkpoint_label(policy_path: str) -> str:
+    """Best-effort short label for a checkpoint (e.g. the step dir '002000')."""
+    p = Path(policy_path)
+    # Typical layout: .../checkpoints/<step>/pretrained_model
+    if p.name == "pretrained_model" and p.parent.name:
+        return p.parent.name
+    return p.name
+
+
+def write_results(results: dict, out_path: Path) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path, "w") as f:
+        json.dump(results, f, indent=2)
+    print(f"[eval] results -> {out_path}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Policy-agnostic closed-loop eval (M5).")
+    parser.add_argument("--policy-path", required=True, help="Checkpoint dir (contains config.json + model.safetensors).")
+    parser.add_argument("--repo-id", required=True, help="Repo id of the dataset the policy trained on.")
+    parser.add_argument("--dataset-root", default=None, help="Local dataset dir (for feature shapes/stats/fps).")
+    parser.add_argument("--device", default="cuda", help="cuda | cpu | mps (auto-falls back if unavailable).")
+    parser.add_argument("--use-amp", action="store_true", help="Enable autocast on CUDA inference.")
+    parser.add_argument("-c", "--cpu", action="store_true", help="Run the Genesis sim on CPU backend.")
+    parser.add_argument("-v", "--vis", action="store_true", help="Show the Genesis viewer.")
+    parser.add_argument("--episodes", type=int, default=10, help="Number of eval episodes.")
+    parser.add_argument("--seed", type=int, default=1000, help="Base RNG seed (offset from training seeds).")
+    parser.add_argument("--max-seconds", type=float, default=15.0, help="Max wall-clock per episode (sim time).")
+    parser.add_argument(
+        "--pick",
+        nargs="+",
+        default=["011_banana"],
+        help="Object(s) to evaluate on; one is sampled per episode.",
+    )
+    parser.add_argument("--place", default="024_bowl", help="Place target object name.")
+    parser.add_argument("--tol", type=float, default=0.08, help="Success tolerance (m).")
+    parser.add_argument("--no-task", action="store_true", help="Send an empty task string (ignore language conditioning).")
+    parser.add_argument("--jitter", type=float, default=0.03, help="Per-episode object position jitter (m).")
+    parser.add_argument("--save-video", action="store_true", help="Save the world-cam rollout of each episode to mp4.")
+    parser.add_argument("--video-dir", default=None, help="Where to write rollout videos (default: eval_videos/<repo>).")
+    parser.add_argument(
+        "--results-out",
+        default=None,
+        help="Write a structured results JSON here (default: eval_results/<repo>/<checkpoint>.json). "
+        "Pass 'none' to skip.",
+    )
+    args = parser.parse_args()
+
+    repo_name = args.repo_id.split("/")[-1]
+    gs.init(backend=gs.cpu if args.cpu else gs.gpu)
+    bundle = build_scene(show_viewer=args.vis, n_envs=1, add_world_cam=True, add_wrist_cam=True)
+
+    pb = load_policy(
+        args.policy_path,
+        args.repo_id,
+        args.dataset_root,
+        args.device,
+        use_amp=args.use_amp,
+    )
+
+    video_dir = Path(args.video_dir) if args.video_dir else _ROOT / "eval_videos" / repo_name
+
+    results = evaluate_policy(
+        bundle, pb,
+        episodes=args.episodes,
+        seed=args.seed,
+        max_seconds=args.max_seconds,
+        pick=args.pick,
+        place=args.place,
+        tol=args.tol,
+        no_task=args.no_task,
+        jitter=args.jitter,
+        save_video=args.save_video,
+        video_dir=video_dir,
+    )
+    if args.save_video:
+        print(f"[eval] rollout videos -> {video_dir}")
+
+    if args.results_out != "none":
+        label = checkpoint_label(args.policy_path)
+        out = Path(args.results_out) if args.results_out else _ROOT / "eval_results" / repo_name / f"{label}.json"
+        results["meta"] = {
+            "policy_path": args.policy_path,
+            "policy_type": pb.policy_type,
+            "checkpoint": label,
+            "repo_id": args.repo_id,
+            "dataset_root": args.dataset_root,
+            "device": str(pb.device),
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+        }
+        write_results(results, out)
+
+
+if __name__ == "__main__":
+    main()
