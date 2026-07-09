@@ -13,6 +13,10 @@ Defaults (per project decision):
 Usage:
     uv run python genesis_scene_build/record_dataset.py --cpu --episodes 10
     # then inspect: it writes to genesis_scene_build/datasets/<name>/
+
+    # M4 Layer-A: appearance-randomized dataset, new domain every 5 successful episodes
+    uv run python genesis_scene_build/record_dataset.py --episodes 50 \
+        --dr-appearance --dr-object-color --dr-table-jitter 0.15 --dr-rebuild-every 5
 """
 
 from __future__ import annotations
@@ -32,7 +36,7 @@ if str(_ROOT) not in sys.path:
 import genesis as gs
 from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-from build_scene import build_scene
+from build_scene import SceneDomainRandomizationConfig, build_scene
 from grasp_demo import TaskSpec, run_pick_place
 from randomize import EnvRandomizer, RandomizationConfig
 
@@ -144,6 +148,29 @@ def build_features(img_wh: tuple[int, int]) -> dict:
     }
 
 
+def _make_scene_dr(args: argparse.Namespace, domain_index: int) -> SceneDomainRandomizationConfig:
+    """M4 Layer-A config for appearance domain ``domain_index`` (seed = base + index).
+
+    Each domain is a distinct built scene (colors/textures/FOV baked at build time); the
+    per-episode object-pose jitter (M2) still varies within a domain. When DR is disabled
+    this returns an inert config so ``build_scene`` behaves exactly as before.
+    """
+    base = args.dr_seed if args.dr_seed is not None else args.seed
+    return SceneDomainRandomizationConfig(
+        enabled=args.dr_appearance,
+        table_color_jitter=args.dr_table_jitter,
+        randomize_object_color=args.dr_object_color,
+        fov_jitter_deg=args.dr_fov_jitter,
+        seed=base + domain_index,
+    )
+
+
+def _build(args: argparse.Namespace, scene_dr: SceneDomainRandomizationConfig):
+    return build_scene(
+        show_viewer=args.vis, n_envs=1, add_world_cam=True, add_wrist_cam=True, scene_dr=scene_dr
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Record scripted pick-and-place into a LeRobotDataset.")
     parser.add_argument("-c", "--cpu", action="store_true", default=False)
@@ -172,6 +199,34 @@ def main() -> None:
         help="Debug: also save failed episodes (task label prefixed with 'FAILED: ') "
         "so you can inspect failure modes in the videos.",
     )
+    # -- M4 Layer-A domain randomization (build-time appearance / intrinsics) --
+    parser.add_argument(
+        "--dr-appearance",
+        action="store_true",
+        help="Enable M4 Layer-A DR: rebuild the scene with a new appearance domain every "
+        "--dr-rebuild-every successful episodes.",
+    )
+    parser.add_argument(
+        "--dr-rebuild-every",
+        type=int,
+        default=5,
+        help="Successful episodes per appearance domain before rebuilding (needs --dr-appearance).",
+    )
+    parser.add_argument(
+        "--dr-table-jitter", type=float, default=0.15, help="Layer-A: +/- per-RGB-channel table color jitter."
+    )
+    parser.add_argument(
+        "--dr-object-color", action="store_true", help="Layer-A: recolor objects within DR_APPEARANCE_PRIORS."
+    )
+    parser.add_argument(
+        "--dr-fov-jitter", type=float, default=0.0, help="Layer-A: +/- deg jitter on both cameras' vertical FOV."
+    )
+    parser.add_argument(
+        "--dr-seed",
+        type=int,
+        default=None,
+        help="Base seed for the appearance-domain sequence (default: --seed). Domain d uses base + d.",
+    )
     args = parser.parse_args()
 
     img_wh = (args.img_width, args.img_height)
@@ -184,8 +239,15 @@ def main() -> None:
 
     max_attempts = args.max_attempts if args.max_attempts > 0 else args.episodes * 5
 
-    gs.init(backend=gs.cpu if args.cpu else gs.gpu)
-    bundle = build_scene(show_viewer=args.vis, n_envs=1, add_world_cam=True, add_wrist_cam=True)
+    backend = gs.cpu if args.cpu else gs.gpu
+    gs.init(backend=backend)
+
+    # M4 Layer-A: the scene's appearance is baked at build time, so a new appearance domain
+    # requires a rebuild. domain_index advances every --dr-rebuild-every successful episodes;
+    # rebuilding uses gs.destroy()+gs.init() (the supported repeated-init pattern) and rebinds
+    # the randomizer + recorder to the fresh bundle. With DR off this stays a single build.
+    domain_index = 0
+    bundle = _build(args, _make_scene_dr(args, domain_index))
 
     dataset = LeRobotDataset.create(
         repo_id=args.repo_id,
@@ -209,6 +271,18 @@ def main() -> None:
     n_failed_saved = 0
     attempts = 0
     while n_success < args.episodes and attempts < max_attempts:
+        # Rebuild into the next appearance domain once this shard's success quota is met.
+        target_domain = n_success // args.dr_rebuild_every
+        if args.dr_appearance and target_domain != domain_index:
+            domain_index = target_domain
+            scene_dr = _make_scene_dr(args, domain_index)
+            gs.destroy()
+            gs.init(backend=backend)
+            bundle = _build(args, scene_dr)
+            randomizer = EnvRandomizer(bundle, RandomizationConfig(randomize_pick=False, seed=args.seed))
+            recorder = EpisodeRecorder(bundle, fps=args.fps, img_wh=img_wh)
+            print(f"[record] rebuilt scene for appearance domain {domain_index} (seed={scene_dr.seed})")
+
         episode_seed = args.seed + attempts
         randomizer.reset(seed=episode_seed)
         pick_object = str(pick_rng.choice(pick_choices))
