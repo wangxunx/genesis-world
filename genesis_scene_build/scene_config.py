@@ -52,6 +52,27 @@ YCB_LAYOUT = {
     "024_bowl": {"pos": (0.50, -0.10, 0.0), "euler": (0.0, 0.0, 0.0)},
 }
 
+# == M4 domain randomization: Layer-A per-object appearance priors ==
+# Domain randomization (DR) of object color is deliberately constrained to each object's
+# *real-world* appearance distribution, so recolored objects stay physically plausible
+# (a banana may drift yellow <-> yellow-green for ripeness, but never turns black/blue).
+#
+# Sampling happens in HSV -- hue in degrees [0, 360), saturation/value in [0, 1] -- because
+# the natural variation of these objects is a narrow band on the hue axis plus a
+# value/saturation range, which is awkward to express in RGB. A value *floor* keeps
+# objects from going implausibly dark.
+#
+# Only objects with an entry here get recolored (and only when object-color DR is turned
+# on); everything else keeps its original mesh texture. The bowl is a container, not a
+# grasp target, so its color is a task-irrelevant nuisance and its band is left wide.
+# Consumed by ``build_scene`` when ``SceneDomainRandomizationConfig.randomize_object_color``.
+DR_APPEARANCE_PRIORS = {
+    "011_banana": {"hue": (48.0, 68.0), "sat": (0.55, 0.95), "val": (0.60, 0.90)},
+    "014_lemon": {"hue": (48.0, 62.0), "sat": (0.60, 1.00), "val": (0.70, 0.95)},
+    "018_plum": {"hue": (300.0, 345.0), "sat": (0.35, 0.80), "val": (0.25, 0.55)},
+    "024_bowl": {"hue": (0.0, 360.0), "sat": (0.00, 0.70), "val": (0.35, 0.90)},
+}
+
 # == Reachable workspace on the tabletop (empirically verified grasp region) ==
 # Objects sampled outside this box tend to be unreachable (IK fails) or drift off the
 # tuned grasp region. Used by the M2 randomizer to clamp jittered object poses.

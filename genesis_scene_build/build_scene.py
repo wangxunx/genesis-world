@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import colorsys
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,7 @@ from genesis.utils.geom import trans_R_to_T, euler_to_R
 
 from scene_config import (
     ASSETS,
+    DR_APPEARANCE_PRIORS,
     FRANKA_EULER,
     FRANKA_FORCE_MAX,
     FRANKA_FORCE_MIN,
@@ -73,17 +75,60 @@ class SceneBundle:
         return out
 
 
+@dataclass
+class SceneDomainRandomizationConfig:
+    """M4 domain randomization -- Layer A: build-time appearance / intrinsics knobs.
+
+    Applied once per ``build_scene`` (i.e. per built scene), *not* per episode: colors,
+    textures and camera intrinsics are baked at ``scene.build()`` and cannot be changed at
+    runtime with the default rasterizer. To sample a new appearance domain, rebuild the
+    scene with a different ``seed``.
+
+    Object recolor is opt-in and constrained to the per-object priors in
+    ``scene_config.DR_APPEARANCE_PRIORS`` (see the note there). Table color and camera FOV
+    are task-irrelevant nuisances, so they are jittered freely without a plausibility prior.
+    """
+
+    enabled: bool = False
+    table_color_jitter: float = 0.0  # +/- per-RGB-channel offset on table + legs
+    randomize_object_color: bool = False  # recolor YCB objects within DR_APPEARANCE_PRIORS
+    fov_jitter_deg: float = 0.0  # +/- deg on both cameras' vertical FOV
+    seed: int | None = None
+
+
+def _dr_jitter_rgb(color, amp: float, dr_rng: np.random.Generator):
+    """DR helper: return ``color`` with a uniform +/- ``amp`` offset per RGB channel (alpha kept)."""
+    if amp <= 0.0:
+        return color
+    rgb = np.clip(np.asarray(color[:3], dtype=float) + dr_rng.uniform(-amp, amp, size=3), 0.0, 1.0)
+    alpha = color[3] if len(color) > 3 else 1.0
+    return (float(rgb[0]), float(rgb[1]), float(rgb[2]), float(alpha))
+
+
+def _dr_sample_object_color(prior: dict, dr_rng: np.random.Generator):
+    """DR helper: sample a plausible ``(r, g, b, a)`` from an object's HSV appearance prior."""
+    h = dr_rng.uniform(*prior["hue"]) / 360.0  # colorsys expects hue in [0, 1)
+    s = dr_rng.uniform(*prior["sat"])
+    v = dr_rng.uniform(*prior["val"])
+    r, g, b = colorsys.hsv_to_rgb(h % 1.0, s, v)
+    return (float(r), float(g), float(b), 1.0)
+
+
 def _ensure_assets() -> Path:
     if not (ASSETS / "robots" / "franka" / "panda.xml").exists():
         setup_assets()
     return ASSETS
 
 
-def _add_table(scene: gs.Scene) -> None:
+def _add_table(scene: gs.Scene, dr_rng: np.random.Generator, scene_dr: "SceneDomainRandomizationConfig | None") -> None:
     cx, cy = TABLE_CENTER
     top_lx, top_ly, top_lz = TABLE_TOP_SIZE
     leg_lx, leg_ly = TABLE_LEG_SIZE
     leg_lz = TABLE_TOP_Z - top_lz
+
+    dr_table_amp = scene_dr.table_color_jitter if (scene_dr and scene_dr.enabled) else 0.0
+    top_color = _dr_jitter_rgb(TABLE_COLOR, dr_table_amp, dr_rng)
+    leg_color = _dr_jitter_rgb(TABLE_LEG_COLOR, dr_table_amp, dr_rng)
 
     # Tabletop: its top surface sits exactly at TABLE_TOP_Z.
     scene.add_entity(
@@ -92,7 +137,7 @@ def _add_table(scene: gs.Scene) -> None:
             pos=(cx, cy, TABLE_TOP_Z - top_lz / 2),
             fixed=True,
         ),
-        surface=gs.surfaces.Default(color=TABLE_COLOR),
+        surface=gs.surfaces.Default(color=top_color),
     )
 
     # Four legs from the floor up to the underside of the tabletop.
@@ -106,7 +151,7 @@ def _add_table(scene: gs.Scene) -> None:
                     pos=(cx + sx * dx, cy + sy * dy, leg_lz / 2),
                     fixed=True,
                 ),
-                surface=gs.surfaces.Default(color=TABLE_LEG_COLOR),
+                surface=gs.surfaces.Default(color=leg_color),
             )
 
 
@@ -117,9 +162,16 @@ def build_scene(
     add_world_cam: bool = True,
     add_wrist_cam: bool = True,
     draw_world_frame: bool = False,
+    scene_dr: "SceneDomainRandomizationConfig | None" = None,
 ) -> SceneBundle:
     assets = _ensure_assets()
     ycb_assets = get_ycb_assets()
+
+    # M4 Layer-A: a single RNG stream drives all build-time appearance/intrinsics DR, so a
+    # given (scene_dr.seed) fully determines the sampled appearance domain.
+    dr_rng = np.random.default_rng(scene_dr.seed if scene_dr else None)
+    dr_enabled = bool(scene_dr and scene_dr.enabled)
+    dr_recolor_objects = dr_enabled and scene_dr.randomize_object_color
 
     cx, cy = TABLE_CENTER
     camera_lookat = (cx, cy, TABLE_TOP_Z)
@@ -143,13 +195,18 @@ def build_scene(
     )
 
     scene.add_entity(gs.morphs.Plane())
-    _add_table(scene)
+    _add_table(scene, dr_rng, scene_dr)
 
     ycb_entities: dict[str, gs.RigidEntity] = {}
     for name, layout in YCB_LAYOUT.items():
         asset = ycb_assets[name]
         x, y, _ = layout["pos"]
         z = TABLE_TOP_Z + asset.rest_z_offset
+        # Layer-A object recolor: only for objects with an appearance prior, and only when
+        # enabled. Passing surface=None keeps the object's original mesh texture.
+        surface = None
+        if dr_recolor_objects and name in DR_APPEARANCE_PRIORS:
+            surface = gs.surfaces.Default(color=_dr_sample_object_color(DR_APPEARANCE_PRIORS[name], dr_rng))
         ycb_entities[name] = scene.add_entity(
             morph=gs.morphs.Mesh(
                 file=str(asset.mesh_path),
@@ -160,6 +217,7 @@ def build_scene(
                 decimate_face_num=500,
             ),
             material=gs.materials.Rigid(rho=300.0, friction=layout.get("friction")),
+            surface=surface,
         )
 
     franka = scene.add_entity(
@@ -170,14 +228,19 @@ def build_scene(
         ),
     )
 
-    # Cameras must be added before scene.build().
+    # Cameras must be added before scene.build(). FOV (intrinsics) can only be set here,
+    # so Layer-A jitters it at build time; extrinsics are left to Layer B (runtime).
+    dr_fov_amp = scene_dr.fov_jitter_deg if dr_enabled else 0.0
+    world_fov = WORLD_CAM_FOV + (float(dr_rng.uniform(-dr_fov_amp, dr_fov_amp)) if dr_fov_amp else 0.0)
+    wrist_fov = WRIST_CAM_FOV + (float(dr_rng.uniform(-dr_fov_amp, dr_fov_amp)) if dr_fov_amp else 0.0)
+
     world_cam = None
     if add_world_cam:
         world_cam = scene.add_camera(
             res=WORLD_CAM_RES,
             pos=WORLD_CAM_POS,
             lookat=WORLD_CAM_LOOKAT,
-            fov=WORLD_CAM_FOV,
+            fov=world_fov,
             GUI=False,
         )
 
@@ -186,7 +249,7 @@ def build_scene(
     if add_wrist_cam:
         wrist_cam = scene.add_camera(
             res=WRIST_CAM_RES,
-            fov=WRIST_CAM_FOV,
+            fov=wrist_fov,
             GUI=False,
         )
         wrist_link = franka.get_link(WRIST_CAM_LINK)
@@ -254,10 +317,41 @@ def main() -> None:
         action="store_true",
         help="Render and save one frame from each camera at the end of the run.",
     )
+    parser.add_argument(
+        "--dr-appearance",
+        action="store_true",
+        help="Enable M4 Layer-A build-time appearance/intrinsics domain randomization.",
+    )
+    parser.add_argument(
+        "--dr-table-jitter",
+        type=float,
+        default=0.15,
+        help="Layer-A: +/- per-RGB-channel jitter on the table/leg color (needs --dr-appearance).",
+    )
+    parser.add_argument(
+        "--dr-object-color",
+        action="store_true",
+        help="Layer-A: recolor YCB objects within their DR_APPEARANCE_PRIORS (needs --dr-appearance).",
+    )
+    parser.add_argument(
+        "--dr-fov-jitter",
+        type=float,
+        default=0.0,
+        help="Layer-A: +/- deg jitter on both cameras' vertical FOV (needs --dr-appearance).",
+    )
+    parser.add_argument("--dr-seed", type=int, default=None, help="Seed for the Layer-A appearance RNG.")
     args = parser.parse_args()
 
     if args.setup_assets:
         setup_assets()
+
+    scene_dr = SceneDomainRandomizationConfig(
+        enabled=args.dr_appearance,
+        table_color_jitter=args.dr_table_jitter,
+        randomize_object_color=args.dr_object_color,
+        fov_jitter_deg=args.dr_fov_jitter,
+        seed=args.dr_seed,
+    )
 
     gs.init(backend=gs.cpu if args.cpu else gs.gpu)
     bundle = build_scene(
@@ -266,6 +360,7 @@ def main() -> None:
         add_world_cam=not args.no_world_cam,
         add_wrist_cam=not args.no_wrist_cam,
         draw_world_frame=args.debug_frame,
+        scene_dr=scene_dr,
     )
 
     # Keep the arm at its initial pose so it does not droop under gravity.
