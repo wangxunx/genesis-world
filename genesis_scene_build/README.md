@@ -6,11 +6,15 @@ A small Franka pick-and-place pipeline built on [Genesis](https://github.com/Gen
 
 | File | Role |
 |------|------|
-| `scene_config.py` | Central config: table geometry, object layout, camera intrinsics/extrinsics, Franka gains, reachable workspace. |
-| `build_scene.py` | Builds the Genesis scene (table + Franka + YCB objects + cameras) and returns a `SceneBundle`. |
+| `scene_config.py` | Central config: table geometry, object layout, camera intrinsics/extrinsics, Franka gains, reachable workspace, and per-object appearance priors (`DR_APPEARANCE_PRIORS`) for domain randomization. |
+| `build_scene.py` | Builds the Genesis scene (table + Franka + YCB objects + cameras) and returns a `SceneBundle`. Applies M4 Layer-A domain randomization (`SceneDomainRandomizationConfig`). |
 | `grasp_demo.py` | Scripted pick-and-place state machine (IK + motion planning + force-controlled grasp), parameterized by `TaskSpec` / `GraspProfile`. |
 | `randomize.py` | Per-episode environment randomization (`EnvRandomizer.reset()`): object poses + task sampling. |
-| `record_dataset.py` | Records scripted episodes into a LeRobot dataset (success-filtered). |
+| `record_dataset.py` | Records scripted episodes into a LeRobot dataset (success-filtered); can rebuild per appearance domain for a DR dataset. |
+| `train_policy.py` | Thin wrapper around `lerobot-train` (ACT / SmolVLA presets) wired to this project's conventions. |
+| `eval_policy.py` | Policy-agnostic closed-loop evaluation of a trained lerobot policy; reports success rate. |
+| `eval_sweep.py` | Sweeps every checkpoint of a run into a success-vs-step curve; optionally across M4 appearance domains. |
+| `dr_preview.py` | Renders the scene under several Layer-A appearance domains and stitches a labeled montage for visual inspection. |
 | `setup_assets.py` | Verifies/populates local assets (YCB meshes + Franka model). Runs automatically on first build. |
 | `scale_ycb.py` | Utility to bake scaled-down copies of YCB meshes (geometry only; textures preserved). |
 
@@ -70,6 +74,8 @@ uv run python genesis_scene_build/build_scene.py --vis --save-frames
 ```
 
 Key flags: `--cpu`, `--vis`, `--n-envs N`, `--steps N`, `--no-world-cam`, `--no-wrist-cam`, `--debug-frame`, `--setup-assets`.
+
+To build under M4 Layer-A domain randomization (baked at build time), add `--dr-appearance` plus any of `--dr-table-jitter <amp>`, `--dr-object-color`, `--dr-fov-jitter <deg>`, `--dr-seed <n>` — see [Domain randomization](#domain-randomization-m4) below.
 
 ### 2. Scripted pick-and-place (`grasp_demo.py`)
 
@@ -139,12 +145,24 @@ Common flags:
 | `--vcodec` | `libsvtav1` | Video codec. |
 | `--overwrite` | off | Delete an existing output dir first. |
 | `--keep-failures` | off | Debug: also save failed episodes (see below). |
+| `--dr-appearance` | off | Enable M4 Layer-A DR: rebuild the scene with a new appearance domain every `--dr-rebuild-every` successful episodes. |
+| `--dr-rebuild-every` | 5 | Successful episodes per appearance domain before rebuilding. |
+| `--dr-table-jitter` / `--dr-object-color` / `--dr-fov-jitter` | 0.15 / off / 0.0 | Layer-A knobs (see [Domain randomization](#domain-randomization-m4)). |
+| `--dr-seed` | `--seed` | Base seed for the appearance-domain sequence (domain `d` uses `base + d`). |
 
 **Debugging failures** (`--keep-failures`): normally only successful episodes are written. With this flag, failed attempts are *also* saved, with their `task` label prefixed by `FAILED: ` (e.g. `"FAILED: pick the lemon and place it in the bowl"`). This lets you watch the failure videos to understand what went wrong. Filter them out when training, e.g. keep only episodes whose task does not start with `FAILED:`.
 
 ```bash
 uv run python genesis_scene_build/record_dataset.py --pick 014_lemon --episodes 5 \
     --keep-failures --root genesis_scene_build/datasets/lemon_debug
+```
+
+**Appearance-randomized dataset** (`--dr-appearance`): the scene appearance is baked at build time, so a new appearance domain requires a rebuild. `--dr-rebuild-every N` advances to a new domain every `N` successful episodes; within a domain the M2 per-episode object-pose jitter still varies. So 50 episodes with `--dr-rebuild-every 5` yields ~10 appearance domains. See [Domain randomization](#domain-randomization-m4).
+
+```bash
+uv run python genesis_scene_build/record_dataset.py --episodes 50 \
+    --dr-appearance --dr-object-color --dr-table-jitter 0.15 --dr-rebuild-every 5 \
+    --repo-id genesis/banana_pick_dr --root genesis_scene_build/datasets/banana_pick_dr
 ```
 
 **Recorded schema** (joint-position action space):
@@ -250,7 +268,7 @@ Every eval writes a structured results JSON (`meta` + aggregate `success_rate` +
 
 ## Sweep checkpoints into a success curve (`eval_sweep.py`)
 
-To see the **fine-tuning learning curve** (and later, to compare training conditions such as domain-randomization ablations), `eval_sweep.py` evaluates *every checkpoint* of a run under an identical, fixed protocol and plots success rate vs training step. It builds the Genesis scene **once** and reloads each checkpoint in turn; because the eval seeds are fixed, every checkpoint faces the *same* initial conditions — so the curve isolates the effect of training progress.
+To see the **fine-tuning learning curve** (and later, to compare training conditions such as domain-randomization ablations), `eval_sweep.py` evaluates *every checkpoint* of a run under an identical, fixed protocol and plots success rate vs training step. By default it builds the Genesis scene **once** and reloads each checkpoint in turn; because the eval seeds are fixed, every checkpoint faces the *same* initial conditions — so the curve isolates the effect of training progress. (With `--dr-appearance` it instead sweeps several appearance domains while keeping the comparison fair — see below.)
 
 ```bash
 uv run python genesis_scene_build/eval_sweep.py \
@@ -262,11 +280,75 @@ uv run python genesis_scene_build/eval_sweep.py \
 
 Outputs (under `eval_results/sweep_<run-name>/`):
 
-- `sweep.json` — full results (per checkpoint + per episode)
+- `sweep.json` — full results: `meta`, `aggregate` (per-checkpoint mean over domains), `per_domain` (per-domain curve rows), `evaluations` (one entry per domain×checkpoint)
 - `sweep.csv` — one row per checkpoint (`step, success_rate, n_success, episodes, policy_type`)
-- `success_curve.png` — success rate vs training step
+- `success_curve.png` — success rate vs training step (with faint per-domain overlays when sweeping >1 domain)
 
 It scans `<run-dir>/checkpoints/<step>/pretrained_model` and skips the `last` symlink. Use `--steps 10000 20000 …` to evaluate only specific checkpoints. **To get a real curve you need multiple checkpoints** — train with a smaller `--save-freq` (e.g. `train_policy.py … --save-freq 2000`) so intermediate steps are saved, not just the final one.
+
+**Appearance-OOD sweep** (`--dr-appearance`): evaluate every checkpoint under `--dr-domains N` M4 appearance domains. The loop is **domain-outer / checkpoint-inner** — the scene is rebuilt once per domain (only `N` rebuilds total), and every checkpoint sees the *identical* set of domains, so the comparison stays fair. Each checkpoint's reported rate is the mean over all domains. Total rollouts = `domains × checkpoints × episodes`, and each domain adds one ~20 s rebuild, so keep `N`/`--episodes` sane for large checkpoint sets.
+
+```bash
+uv run python genesis_scene_build/eval_sweep.py \
+    --run-dir outputs/train/act_banana_pick_50ep_step30000 \
+    --repo-id genesis/banana_pick \
+    --dataset-root genesis_scene_build/datasets/banana_pick_50ep \
+    --episodes 20 --dr-appearance --dr-domains 5 --dr-object-color
+```
+
+Without `--dr-appearance` the sweep behaves exactly as before (single build, one domain). DR flags mirror the other scripts: `--dr-domains`, `--dr-table-jitter`, `--dr-object-color`, `--dr-fov-jitter`, `--dr-seed`.
+
+## Domain randomization (M4)
+
+Domain randomization (DR) is organized into three layers by *where* and *when* the variation is applied:
+
+| Layer | When | What | Status |
+|-------|------|------|--------|
+| **A** | build time (per built scene) | object color, table color, camera FOV (intrinsics) | **implemented** |
+| **B** | runtime (per episode) | friction, mass, camera extrinsics | planned |
+| **C** | training time (per frame) | photometric jitter (brightness/contrast/hue/…) via lerobot's built-in `--dataset.image_transforms` | via lerobot config |
+
+The split exists because the default Genesis rasterizer bakes colors/textures/intrinsics at `scene.build()` and cannot change them at runtime — so appearance/intrinsics DR must happen at build time (Layer A), while dynamics and extrinsics can be jittered per episode (Layer B).
+
+### Layer A knobs
+
+Configured by `SceneDomainRandomizationConfig` (in `build_scene.py`) and exposed as `--dr-*` flags on `build_scene.py`, `record_dataset.py`, and `eval_sweep.py`:
+
+| Knob | Flag | Notes |
+|------|------|-------|
+| Table/leg color | `--dr-table-jitter <amp>` | Uniform ±`amp` per-RGB-channel jitter. Task-irrelevant *nuisance* — free to randomize widely. |
+| Object color | `--dr-object-color` | **Opt-in.** Recolors objects **within per-object plausibility priors** (see below). Replaces the mesh texture with a flat plausible color. |
+| Camera FOV | `--dr-fov-jitter <deg>` | ±`deg` on both cameras' vertical FOV (intrinsics; can only be set at build time). |
+| Domain seed | `--dr-seed <n>` | Base seed; appearance domain `d` uses `n + d`, so runs are reproducible. |
+
+Lighting is intentionally **not** a Layer-A knob: `scene.add_light` requires Genesis's `BatchRenderer`, whereas this project uses the default rasterizer. Do lighting-like variation at Layer C (photometric jitter) instead.
+
+### Plausible object recolor (per-object priors)
+
+Object recolor is constrained to each object's *real-world* appearance distribution via `DR_APPEARANCE_PRIORS` in `scene_config.py`, so recolored objects stay physically sensible (a banana drifts yellow↔yellow-green for ripeness but never turns black or blue). Sampling is done in **HSV** — a narrow hue band plus saturation/value ranges with a value floor (prevents implausibly dark colors). Objects without an entry keep their original texture; the bowl is a container (not a grasp target), so its color is a nuisance and its band is left wide.
+
+### Preview the appearance domains (`dr_preview.py`)
+
+Renders the scene under a baseline (DR off) plus one tile per seed and stitches a labeled montage into `eval_results/dr_preview/` (instead of dumping PNGs into the repo root). Each domain is rendered in its own subprocess (fresh `gs.init` + build), so the montage is reproducible given the same seeds.
+
+```bash
+# baseline + 4 seeds, recolor objects, jitter table + FOV
+uv run python genesis_scene_build/dr_preview.py \
+    --seeds 0 1 2 3 --object-color --table-jitter 0.15 --fov-jitter 2.0
+
+# nuisance-only (keep original object textures), also montage the wrist cam
+uv run python genesis_scene_build/dr_preview.py --seeds 0 1 2 --table-jitter 0.2 --wrist
+```
+
+Outputs: `eval_results/dr_preview/world_montage.png` (+ `wrist_montage.png` with `--wrist`) and the per-domain frames under `frames/`.
+
+### Where Layer A is wired in
+
+- **`build_scene.py`** — one scene under a chosen domain (for inspection / `dr_preview`).
+- **`record_dataset.py`** — rebuilds every `--dr-rebuild-every N` successful episodes to spread multiple appearance domains across one dataset (variety is purely beneficial when generating data).
+- **`eval_sweep.py`** — sweeps `--dr-domains N` domains **domain-outer / checkpoint-inner**, so every checkpoint is scored on the identical set of domains (fair comparison); reports the per-checkpoint mean plus per-domain curves.
+
+Recommendation: `--dr-object-color` is the most aggressive knob (it discards the realistic YCB texture), so consider leaving it off — randomize the nuisances (table + FOV) at Layer A and get object-appearance variety from Layer C photometric jitter at training time.
 
 ## Object grasp reliability
 
