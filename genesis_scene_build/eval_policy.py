@@ -293,21 +293,50 @@ def evaluate_policy(
     prefix = f"[eval:{label}]" if label else "[eval]"
 
     n_success = 0
+    n_diverged = 0
     per_object: dict[str, list[int]] = {}
     episodes_detail: list[dict] = []
     for ep in range(episodes):
         episode_seed = seed + ep
-        randomizer.reset(seed=episode_seed)
+        # Pick is drawn from its own RNG (independent of the randomizer), so sampling it up
+        # front keeps the sequence identical while making pick_object available even if the
+        # reset/rollout below raises.
         pick_object = str(pick_rng.choice(pick_choices))
         task = TaskSpec(pick_object=pick_object, place_target=place, success_tol=tol)
         task_text = None if no_task else task_description(pick_object)
 
-        result = run_episode(
-            bundle, pb, task,
-            task_text=task_text,
-            max_seconds=max_seconds,
-            record_video=save_video,
-        )
+        try:
+            randomizer.reset(seed=episode_seed)
+            result = run_episode(
+                bundle, pb, task,
+                task_text=task_text,
+                max_seconds=max_seconds,
+                record_video=save_video,
+            )
+        except gs.GenesisException as exc:
+            # A physics divergence (NaN forces/accelerations, e.g. a stiff contact under
+            # aggressive Layer-B friction/mass DR) must abort only this episode -- not the whole
+            # sweep. It is counted as a failure and flagged. The next episode's randomizer.reset()
+            # rewrites all poses to finite values with zero velocity and clears the solver error
+            # flag, so the sim self-heals without a rebuild.
+            n_diverged += 1
+            per_object.setdefault(pick_object, []).append(0)
+            episodes_detail.append(
+                {
+                    "ep": ep,
+                    "seed": episode_seed,
+                    "pick": pick_object,
+                    "steps": 0,
+                    "success": False,
+                    "diverged": True,
+                }
+            )
+            print(
+                f"{prefix} ep {ep:03d} seed={episode_seed} pick={pick_object} "
+                f"-> DIVERGED ({exc}); counted as failure"
+            )
+            continue
+
         n_success += int(result.success)
         per_object.setdefault(pick_object, []).append(int(result.success))
         episodes_detail.append(
@@ -317,6 +346,7 @@ def evaluate_policy(
                 "pick": pick_object,
                 "steps": result.n_policy_steps,
                 "success": bool(result.success),
+                "diverged": False,
             }
         )
 
@@ -330,7 +360,8 @@ def evaluate_policy(
         )
 
     rate = n_success / max(1, episodes)
-    print(f"{prefix} success rate: {n_success}/{episodes} = {rate:.1%}")
+    diverged_note = f" ({n_diverged} diverged)" if n_diverged else ""
+    print(f"{prefix} success rate: {n_success}/{episodes} = {rate:.1%}{diverged_note}")
     per_object_summary = {
         obj: {"n": len(hits), "success": int(sum(hits)), "rate": sum(hits) / len(hits)}
         for obj, hits in sorted(per_object.items())
@@ -342,6 +373,7 @@ def evaluate_policy(
     return {
         "episodes": episodes,
         "n_success": n_success,
+        "n_diverged": n_diverged,
         "success_rate": rate,
         "per_object": per_object_summary,
         "episodes_detail": episodes_detail,

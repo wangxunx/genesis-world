@@ -255,7 +255,9 @@ def main() -> None:
     gs.init(backend=backend)
 
     # Aggregate per checkpoint across all domains (preserves checkpoint order).
-    agg: dict[int, dict] = {step: {"checkpoint": str(pm), "n_success": 0, "episodes": 0} for step, pm in checkpoints}
+    agg: dict[int, dict] = {
+        step: {"checkpoint": str(pm), "n_success": 0, "episodes": 0, "n_diverged": 0} for step, pm in checkpoints
+    }
     per_ckpt_full: list[dict] = []   # one entry per (domain, checkpoint)
     per_domain: list[dict] = []      # per-domain curve rows, for plotting/overlay
 
@@ -304,10 +306,12 @@ def main() -> None:
             )
             agg[step]["n_success"] += res["n_success"]
             agg[step]["episodes"] += res["episodes"]
+            agg[step]["n_diverged"] += res.get("n_diverged", 0)
             agg[step]["policy_type"] = pb.policy_type
             domain_rows.append(
                 {"step": step, "success_rate": res["success_rate"],
-                 "n_success": res["n_success"], "episodes": res["episodes"]}
+                 "n_success": res["n_success"], "episodes": res["episodes"],
+                 "n_diverged": res.get("n_diverged", 0)}
             )
             per_ckpt_full.append(
                 {"domain": d, "scene_seed": scene_seed, "eval_seed": eval_seed,
@@ -322,6 +326,7 @@ def main() -> None:
             "success_rate": v["n_success"] / max(1, v["episodes"]),
             "n_success": v["n_success"],
             "episodes": v["episodes"],
+            "n_diverged": v["n_diverged"],
             "policy_type": v.get("policy_type"),
         }
         for step, v in agg.items()
@@ -357,7 +362,9 @@ def main() -> None:
     with open(out_dir / "sweep.json", "w") as f:
         json.dump(sweep, f, indent=2)
     with open(out_dir / "sweep.csv", "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=["step", "success_rate", "n_success", "episodes", "policy_type"])
+        w = csv.DictWriter(
+            f, fieldnames=["step", "success_rate", "n_success", "episodes", "n_diverged", "policy_type"]
+        )
         w.writeheader()
         w.writerows(rows)
     title = f"{run_dir.name}: success vs step"
@@ -365,9 +372,16 @@ def main() -> None:
         title += f" ({n_domains} appearance domains)"
     plot_curve(rows, out_dir / "success_curve.png", title=title, per_domain=per_domain)
 
+    total_diverged = sum(r["n_diverged"] for r in rows)
     print("\n[sweep] summary (aggregate over domains):")
     for r in rows:
-        print(f"  step {r['step']:>7}: {r['n_success']}/{r['episodes']} = {r['success_rate']:.1%}")
+        note = f"  ({r['n_diverged']} diverged)" if r["n_diverged"] else ""
+        print(f"  step {r['step']:>7}: {r['n_success']}/{r['episodes']} = {r['success_rate']:.1%}{note}")
+    if total_diverged:
+        print(
+            f"[sweep] NOTE: {total_diverged} episode(s) diverged (NaN physics) and were counted as "
+            f"failures. Consider narrowing the DR ranges or raising sim substeps if this is large."
+        )
     print(f"\n[sweep] wrote: {out_dir}/sweep.json, sweep.csv, success_curve.png")
 
 
