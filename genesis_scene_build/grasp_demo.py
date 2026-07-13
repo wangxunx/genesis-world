@@ -45,6 +45,17 @@ LIFT_HAND_Z = TABLE_TOP_Z + 0.30  # absolute world z to lift the hand to after g
 RETREAT_HAND_Z = TABLE_TOP_Z + 0.35  # absolute world z to retreat to after releasing
 PLACE_HAND_Z_ABOVE_TARGET = 0.16  # hand-link height above the place reference z when releasing
 
+# Vertical offset from the hand-link origin (the IK target) down to the fingertip midline.
+# Used by the geometry-adaptive grasp height to line the fingertips up with an object's center.
+HAND_TO_FINGERTIP = 0.105
+# Aim the fingertips this fraction of the object's half-height *below* its vertical center, so
+# the jaws cup just under the equator of a round object (grasping exactly at the widest point is
+# marginal -- a squeezed convex object slips out). Scales with object size.
+GRASP_CENTER_DROP_FRAC = 0.45
+# Minimum gap kept between the hand body / finger crossbar and the top of the object, so the
+# crossbar does not graze (and roll away) a round object before the fingers close.
+PALM_CLEARANCE = 0.02
+
 GRIPPER_OPEN = 0.04
 
 MOTORS_DOF = np.arange(7)
@@ -56,8 +67,13 @@ class GraspProfile:
     """Per-object top-down grasp parameters."""
 
     yaw_offset: float = 90.0  # deg added to the object yaw to orient the jaws
-    grasp_hand_z: float = TABLE_TOP_Z + 0.105  # absolute hand-link z at grasp
+    grasp_hand_z: float = TABLE_TOP_Z + 0.105  # absolute hand-link z at grasp (used when center_align=False)
     close_force: float = -10.0  # N, finger force-control while holding the grasp
+    # When True, the grasp height is computed at runtime from the object's actual AABB
+    # (fingertips aligned to the object center + a crossbar-clearance floor above its top)
+    # instead of the fixed grasp_hand_z. Meant for round/near-spherical objects, where a
+    # too-deep fixed descent lets the crossbar graze the top and roll the object away.
+    center_align: bool = False
 
 
 # Defaults are tuned for the banana; other objects fall back to DEFAULT_PROFILE
@@ -67,12 +83,13 @@ GRASP_PROFILES: dict[str, GraspProfile] = {
     "011_banana": GraspProfile(yaw_offset=90.0, grasp_hand_z=TABLE_TOP_Z + 0.105, close_force=-10.0),
     # apple/orange: large smooth spheres (~7.5 cm, original scale) -- only marginally
     # graspable (excluded from the reliable pickable pool); profiles kept for completeness.
-    "013_apple": GraspProfile(yaw_offset=0.0, grasp_hand_z=TABLE_TOP_Z + 0.10, close_force=-12.0),
-    "017_orange": GraspProfile(yaw_offset=0.0, grasp_hand_z=TABLE_TOP_Z + 0.12, close_force=-12.0),
+    # Round -> center_align so the fingertips meet the equator and the crossbar clears the top.
+    "013_apple": GraspProfile(yaw_offset=0.0, close_force=-12.0, center_align=True),
+    "017_orange": GraspProfile(yaw_offset=0.0, close_force=-12.0, center_align=True),
     # lemon: small oblate ellipsoid, grasped near its equator -- reliable (verified 6/6).
-    "014_lemon": GraspProfile(yaw_offset=0.0, grasp_hand_z=TABLE_TOP_Z + 0.10, close_force=-12.0),
+    "014_lemon": GraspProfile(yaw_offset=0.0, close_force=-12.0, center_align=True),
     # plum: small near-sphere, grasped near its equator -- reliable (verified 5/5).
-    "018_plum": GraspProfile(yaw_offset=0.0, grasp_hand_z=TABLE_TOP_Z + 0.10, close_force=-12.0),
+    "018_plum": GraspProfile(yaw_offset=0.0, close_force=-12.0, center_align=True),
     # pear: profile kept for completeness, but its round cross-section slips on lift
     # (not reliably graspable -- excluded from the pickable pool). Jaws close across short axis.
     "016_pear": GraspProfile(yaw_offset=90.0, grasp_hand_z=TABLE_TOP_Z + 0.13, close_force=-12.0),
@@ -120,6 +137,43 @@ def _obj_xy_yaw(entity) -> tuple[np.ndarray, float]:
     quat = entity.get_quat().cpu().numpy().reshape(-1)
     yaw = float(quat_to_xyz(quat, degrees=True)[2])
     return pos, yaw
+
+
+def _entity_aabb(entity) -> np.ndarray:
+    """Return the entity's world-frame AABB as a (2, 3) array: row 0 = min, row 1 = max."""
+    aabb = entity.get_AABB()
+    if hasattr(aabb, "detach"):
+        aabb = aabb.detach().cpu().numpy()
+    aabb = np.asarray(aabb)
+    if aabb.ndim == 3:  # (n_envs, 2, 3) for batched builds -> take the first env
+        aabb = aabb[0]
+    return aabb
+
+
+def _grasp_hand_z(entity, profile: GraspProfile) -> float:
+    """Absolute hand-link z at which to close the gripper.
+
+    For ``center_align`` profiles this is derived from the object's actual (post-settle) AABB
+    rather than a fixed constant, combining two conditions:
+
+    * jaw alignment -- put the fingertip midline just below the object's vertical center (its
+      equator for a sphere) so the jaws cup under it: ``center_z - drop`` where ``drop`` is
+      ``GRASP_CENTER_DROP_FRAC`` of the half-height. Hand z = that + ``HAND_TO_FINGERTIP``;
+    * crossbar clearance (floor) -- keep the hand/crossbar above the object's top with a margin,
+      so a large object can't be grazed before the jaws close: ``top_z + PALM_CLEARANCE``.
+
+    The higher (safer) of the two is used. Non-``center_align`` profiles keep the tuned constant.
+    """
+    if not profile.center_align:
+        return profile.grasp_hand_z
+    aabb = _entity_aabb(entity)
+    z_min, z_max = float(aabb[0, 2]), float(aabb[1, 2])
+    center_z = 0.5 * (z_min + z_max)
+    half_height = 0.5 * (z_max - z_min)
+    fingertip_z = center_z - GRASP_CENTER_DROP_FRAC * half_height
+    z_jaw_align = fingertip_z + HAND_TO_FINGERTIP
+    z_top_clear = z_max + PALM_CLEARANCE
+    return max(z_jaw_align, z_top_clear)
 
 
 def _ik(bundle, pos: np.ndarray, quat: np.ndarray) -> np.ndarray:
@@ -231,11 +285,14 @@ def run_pick_place(bundle, task: TaskSpec, *, save_frames: bool = False, recorde
     snap("01_pregrasp")
 
     # 2) Descend straight down to grasp height (vertical path avoids grazing the object).
+    # For round objects grasp_z is derived from the object's actual AABB (center-aligned jaws +
+    # crossbar clearance) so the descent isn't too deep; others use the tuned constant.
+    grasp_z = _grasp_hand_z(pick_entity, profile)
     _descend_vertical(
-        bundle, (obj_pos[0], obj_pos[1]), pregrasp[2], profile.grasp_hand_z, grasp_quat,
+        bundle, (obj_pos[0], obj_pos[1]), pregrasp[2], grasp_z, grasp_quat,
         finger=GRIPPER_OPEN, recorder=recorder,
     )
-    grasp = np.array([obj_pos[0], obj_pos[1], profile.grasp_hand_z])
+    grasp = np.array([obj_pos[0], obj_pos[1], grasp_z])
     snap("02_reach")
 
     # 3) Close the gripper with force control.
