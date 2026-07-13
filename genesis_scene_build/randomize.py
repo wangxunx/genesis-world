@@ -1,9 +1,12 @@
 """M2 environment randomization: per-episode reset() for the Franka scene.
 
-This is the first (small-amplitude) stage of M2. It randomizes only the *task*
-variety that pick-and-place inherently needs -- object poses and task selection --
-and deliberately leaves domain randomization (friction, mass, lighting, camera
-jitter, textures) to M4.
+This is the first (small-amplitude) stage of M2. It randomizes the *task* variety
+that pick-and-place inherently needs -- object poses and task selection -- and,
+opt-in, the M4 Layer-B runtime domain randomization (per-episode friction, per-object
+mass and world-camera extrinsics; see ``DomainRandomizationConfig``). Build-time
+appearance/intrinsics DR (M4 Layer A) lives in ``build_scene`` instead, since it must
+be baked at ``scene.build()``. Layer B is disabled by default, so the base M2 behavior
+is unchanged unless ``RandomizationConfig.dr.enabled`` is set.
 
 Design choices (per user):
 
@@ -27,7 +30,7 @@ Usage:
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -44,6 +47,8 @@ from scene_config import (
     REACH_X,
     REACH_Y,
     TABLE_TOP_Z,
+    WORLD_CAM_LOOKAT,
+    WORLD_CAM_POS,
     YCB_LAYOUT,
     get_ycb_assets,
 )
@@ -61,6 +66,47 @@ OVERLAP_MARGIN = 0.02
 
 
 @dataclass
+class DomainRandomizationConfig:
+    """M4 domain randomization -- Layer B: per-episode runtime physics / camera-extrinsics knobs.
+
+    Unlike Layer A (baked once at ``build_scene``), these are re-sampled every ``reset()`` and
+    applied to the *already-built* scene, so a single built scene yields a different physical /
+    geometric domain each episode. They are driven by the same per-episode RNG as the pose
+    jitter, so a given ``reset(seed)`` fully determines the episode's whole domain.
+
+    Dynamics
+    --------
+    Friction is sampled as a single multiplicative ``ratio`` and applied uniformly to the YCB
+    objects, the Franka links (only the fingers/hand actually contact anything) and the
+    tabletop. Genesis defines a contact pair's friction as ``max()`` over the two geoms, so
+    scaling only the object would be masked by the (unchanged) fingers/table; scaling every
+    relevant surface by the same ratio makes the *effective* grip / support friction scale
+    with it.     Object mass is scaled by a per-object ratio (applied via ``set_mass_shift`` relative to the
+    captured base mass); the robot mass is left fixed so the tuned kp/kv stay valid.
+
+    Camera extrinsics
+    -----------------
+    Only the static world camera is jittered (``set_pose``), since it is set once and persists.
+    The wrist camera is eye-in-hand -- re-derived every step via ``move_to_attach()`` -- so
+    jittering its extrinsics needs re-attach plumbing and is intentionally deferred.
+    """
+
+    enabled: bool = False
+
+    # -- dynamics --
+    friction_ratio_range: tuple[float, float] = (0.7, 1.3)  # multiplicative, shared across surfaces
+    # Multiplicative per-object mass ratio (converted to set_mass_shift additively from each
+    # object's captured base mass). A ratio -- rather than an absolute +/- kg shift -- keeps the
+    # mass strictly positive for light YCB objects (a fixed kg shift can drive a ~30 g object
+    # negative, which makes the solver diverge to NaN).
+    mass_ratio_range: tuple[float, float] = (0.8, 1.2)
+
+    # -- world-camera extrinsics (0 disables; opt-in) --
+    cam_pos_jitter: float = 0.0  # +/- m, per-axis on world-cam position
+    cam_lookat_jitter: float = 0.0  # +/- m, per-axis on world-cam lookat point
+
+
+@dataclass
 class RandomizationConfig:
     """Knobs for one episode's randomization. Defaults are the small-start regime."""
 
@@ -75,6 +121,7 @@ class RandomizationConfig:
     settle_steps: int = 80  # physics steps to let objects/arm settle after teleport
     success_tol: float = 0.08  # forwarded into the sampled TaskSpec
     seed: int | None = None
+    dr: DomainRandomizationConfig = field(default_factory=DomainRandomizationConfig)  # M4 Layer B
 
 
 class EnvRandomizer:
@@ -95,6 +142,16 @@ class EnvRandomizer:
         # Per-object safe jitter: half the clearance to the nearest neighbor slot, so
         # that even if two neighbors jitter toward each other they cannot overlap.
         self.safe_jitter = self._compute_safe_jitter()
+
+        # Base world-camera extrinsics that Layer-B camera jitter perturbs around. Captured
+        # from config (the scene builds the world cam at exactly these values).
+        self._base_cam_pos = np.asarray(WORLD_CAM_POS, dtype=float)
+        self._base_cam_lookat = np.asarray(WORLD_CAM_LOOKAT, dtype=float)
+
+        # Per-object base link masses (kg), captured once before any DR so mass-ratio scaling
+        # is relative to the pristine mass and never compounds across episodes. Populated lazily
+        # on first dynamics randomization (needs a built scene).
+        self._base_mass: dict[str, np.ndarray] = {}
 
     def _compute_safe_jitter(self) -> dict[str, float]:
         safe: dict[str, float] = {}
@@ -119,7 +176,14 @@ class EnvRandomizer:
 
         self._reset_robot()
         self._place_objects()
+        # M4 Layer B: friction/mass must be set *before* settling so the settle contacts
+        # already use this episode's dynamics; camera extrinsics are physics-independent and
+        # applied after settling.
+        if self.cfg.dr.enabled:
+            self._randomize_dynamics()
         self._settle()
+        if self.cfg.dr.enabled:
+            self._randomize_cameras()
         return self._sample_task()
 
     # -- internals ----------------------------------------------------------
@@ -143,6 +207,82 @@ class EnvRandomizer:
             entity = self.bundle.ycb[name]
             entity.set_pos(np.array([x, y, z]), relative=False, zero_velocity=True, skip_forward=True)
             entity.set_quat(quat, relative=False, zero_velocity=True, skip_forward=False)
+
+    # -- M4 Layer B: runtime domain randomization --------------------------
+
+    def _randomize_dynamics(self) -> None:
+        """Re-sample per-episode friction and per-object mass on the built scene.
+
+        Friction uses a single shared ratio (see ``DomainRandomizationConfig``) applied to the
+        objects, the Franka links and the tabletop so the effective ``max()`` contact friction
+        actually scales. ``set_friction_ratio`` / ``set_mass_shift`` overwrite (not compound)
+        the solver's ratio / shift fields, so calling them every reset is safe.
+        """
+        dr = self.cfg.dr
+        b = self.bundle
+
+        lo, hi = dr.friction_ratio_range
+        ratio = float(self.rng.uniform(lo, hi))
+        self._set_friction_ratio(b.franka, ratio)
+        for name in self.names:
+            self._set_friction_ratio(b.ycb[name], ratio)
+        for table_entity in getattr(b, "table", []) or []:
+            self._set_friction_ratio(table_entity, ratio)
+
+        mlo, mhi = dr.mass_ratio_range
+        if not (mlo == 1.0 and mhi == 1.0):
+            for name in self.names:
+                base = self._object_base_mass(name)  # per-link base mass (kg)
+                mass_ratio = float(self.rng.uniform(mlo, mhi))
+                self._set_mass_shift(b.ycb[name], base * (mass_ratio - 1.0))
+
+    def _randomize_cameras(self) -> None:
+        """Jitter the static world-camera extrinsics around the config baseline."""
+        dr = self.cfg.dr
+        if self.bundle.world_cam is None or (dr.cam_pos_jitter <= 0.0 and dr.cam_lookat_jitter <= 0.0):
+            return
+        pos = self._base_cam_pos.copy()
+        lookat = self._base_cam_lookat.copy()
+        if dr.cam_pos_jitter > 0.0:
+            pos = pos + self.rng.uniform(-dr.cam_pos_jitter, dr.cam_pos_jitter, size=3)
+        if dr.cam_lookat_jitter > 0.0:
+            lookat = lookat + self.rng.uniform(-dr.cam_lookat_jitter, dr.cam_lookat_jitter, size=3)
+        self.bundle.world_cam.set_pose(pos=pos.tolist(), lookat=lookat.tolist())
+
+    def _batch_shape(self, n_links: int) -> tuple[int, ...]:
+        """Return the (per-env) shape expected by set_friction_ratio / set_mass_shift.
+
+        A single-env build reports ``scene.n_envs == 0`` and the solver adds the batch dim
+        itself, so we pass an unbatched ``(n_links,)`` in that case and ``(n_envs, n_links)``
+        for batched builds.
+        """
+        n_envs = self.bundle.scene.n_envs
+        return (n_links,) if n_envs == 0 else (n_envs, n_links)
+
+    def _object_base_mass(self, name: str) -> np.ndarray:
+        """Per-link base mass (kg) of a YCB object, captured once and cached."""
+        if name not in self._base_mass:
+            entity = self.bundle.ycb[name]
+            mass = np.asarray(entity.get_links_inertial_mass().cpu().numpy(), dtype=np.float64)
+            # Collapse any env batch dim to per-link masses (masses are identical across envs).
+            if mass.ndim > 1:
+                mass = mass.reshape(-1, entity.n_links)[0]
+            self._base_mass[name] = mass.reshape(-1)[: entity.n_links]
+        return self._base_mass[name]
+
+    def _set_friction_ratio(self, entity, ratio: float) -> None:
+        n = entity.n_links
+        entity.set_friction_ratio(
+            np.full(self._batch_shape(n), ratio, dtype=np.float32),
+            links_idx_local=np.arange(n),
+        )
+
+    def _set_mass_shift(self, entity, shift_per_link: np.ndarray) -> None:
+        n = entity.n_links
+        shift = np.broadcast_to(np.asarray(shift_per_link, dtype=np.float32), (n,))
+        n_envs = self.bundle.scene.n_envs
+        payload = shift if n_envs == 0 else np.tile(shift, (n_envs, 1))
+        entity.set_mass_shift(payload, links_idx_local=np.arange(n))
 
     def _settle(self) -> None:
         hold = np.asarray(FRANKA_QPOS, dtype=float)
@@ -199,13 +339,48 @@ def main() -> None:
     parser.add_argument("-n", "--episodes", type=int, default=5, help="Number of episodes to run.")
     parser.add_argument("--seed", type=int, default=0, help="Base RNG seed.")
     parser.add_argument("--jitter", type=float, default=0.03, help="Position jitter (m).")
+    # M4 Layer B (runtime domain randomization) knobs.
+    parser.add_argument(
+        "--dr-runtime", action="store_true", default=False, help="Enable M4 Layer-B runtime DR."
+    )
+    parser.add_argument(
+        "--dr-friction",
+        type=float,
+        nargs=2,
+        metavar=("LO", "HI"),
+        default=(0.7, 1.3),
+        help="Friction ratio range (shared across object/finger/table).",
+    )
+    parser.add_argument(
+        "--dr-mass",
+        type=float,
+        nargs=2,
+        metavar=("LO", "HI"),
+        default=(0.8, 1.2),
+        help="Per-object multiplicative mass-ratio range.",
+    )
+    parser.add_argument("--dr-cam-pos", type=float, default=0.0, help="World-cam position jitter (+/- m).")
+    parser.add_argument("--dr-cam-lookat", type=float, default=0.0, help="World-cam lookat jitter (+/- m).")
     args = parser.parse_args()
 
     gs.init(backend=gs.cpu if args.cpu else gs.gpu)
     bundle = build_scene(show_viewer=args.vis, n_envs=1, add_world_cam=True, add_wrist_cam=True)
 
-    cfg = RandomizationConfig(pos_jitter=args.jitter, seed=args.seed)
+    dr_cfg = DomainRandomizationConfig(
+        enabled=args.dr_runtime,
+        friction_ratio_range=tuple(args.dr_friction),
+        mass_ratio_range=tuple(args.dr_mass),
+        cam_pos_jitter=args.dr_cam_pos,
+        cam_lookat_jitter=args.dr_cam_lookat,
+    )
+    cfg = RandomizationConfig(pos_jitter=args.jitter, seed=args.seed, dr=dr_cfg)
     randomizer = EnvRandomizer(bundle, cfg)
+    if args.dr_runtime:
+        print(
+            f"[randomize] M4 Layer-B DR on: friction={dr_cfg.friction_ratio_range} "
+            f"mass_ratio={dr_cfg.mass_ratio_range} cam_pos={dr_cfg.cam_pos_jitter} "
+            f"cam_lookat={dr_cfg.cam_lookat_jitter}"
+        )
 
     n_success = 0
     for ep in range(args.episodes):

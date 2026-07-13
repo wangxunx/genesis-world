@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 import colorsys
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -58,6 +58,10 @@ class SceneBundle:
     ycb: dict[str, gs.RigidEntity]
     world_cam: "gs.vis.camera.Camera | None" = None
     wrist_cam: "gs.vis.camera.Camera | None" = None
+    # Static tabletop + leg entities. Kept so runtime DR (M4 Layer B) can scale table
+    # friction: contact friction is max() over the pair, so the tabletop must be scaled
+    # alongside the object for the effective object<->table friction to actually change.
+    table: list = field(default_factory=list)
     _wrist_link: "gs.RigidLink | None" = None
 
     def update_wrist_cam(self) -> None:
@@ -120,7 +124,9 @@ def _ensure_assets() -> Path:
     return ASSETS
 
 
-def _add_table(scene: gs.Scene, dr_rng: np.random.Generator, scene_dr: "SceneDomainRandomizationConfig | None") -> None:
+def _add_table(
+    scene: gs.Scene, dr_rng: np.random.Generator, scene_dr: "SceneDomainRandomizationConfig | None"
+) -> list:
     cx, cy = TABLE_CENTER
     top_lx, top_ly, top_lz = TABLE_TOP_SIZE
     leg_lx, leg_ly = TABLE_LEG_SIZE
@@ -130,14 +136,19 @@ def _add_table(scene: gs.Scene, dr_rng: np.random.Generator, scene_dr: "SceneDom
     top_color = _dr_jitter_rgb(TABLE_COLOR, dr_table_amp, dr_rng)
     leg_color = _dr_jitter_rgb(TABLE_LEG_COLOR, dr_table_amp, dr_rng)
 
-    # Tabletop: its top surface sits exactly at TABLE_TOP_Z.
-    scene.add_entity(
-        morph=gs.morphs.Box(
-            size=TABLE_TOP_SIZE,
-            pos=(cx, cy, TABLE_TOP_Z - top_lz / 2),
-            fixed=True,
-        ),
-        surface=gs.surfaces.Default(color=top_color),
+    table_entities = []
+
+    # Tabletop: its top surface sits exactly at TABLE_TOP_Z. Listed first so callers can
+    # rely on table[0] being the surface that objects rest on.
+    table_entities.append(
+        scene.add_entity(
+            morph=gs.morphs.Box(
+                size=TABLE_TOP_SIZE,
+                pos=(cx, cy, TABLE_TOP_Z - top_lz / 2),
+                fixed=True,
+            ),
+            surface=gs.surfaces.Default(color=top_color),
+        )
     )
 
     # Four legs from the floor up to the underside of the tabletop.
@@ -145,14 +156,18 @@ def _add_table(scene: gs.Scene, dr_rng: np.random.Generator, scene_dr: "SceneDom
     dy = top_ly / 2 - TABLE_LEG_INSET
     for sx in (-1, 1):
         for sy in (-1, 1):
-            scene.add_entity(
-                morph=gs.morphs.Box(
-                    size=(leg_lx, leg_ly, leg_lz),
-                    pos=(cx + sx * dx, cy + sy * dy, leg_lz / 2),
-                    fixed=True,
-                ),
-                surface=gs.surfaces.Default(color=leg_color),
+            table_entities.append(
+                scene.add_entity(
+                    morph=gs.morphs.Box(
+                        size=(leg_lx, leg_ly, leg_lz),
+                        pos=(cx + sx * dx, cy + sy * dy, leg_lz / 2),
+                        fixed=True,
+                    ),
+                    surface=gs.surfaces.Default(color=leg_color),
+                )
             )
+
+    return table_entities
 
 
 def build_scene(
@@ -195,7 +210,7 @@ def build_scene(
     )
 
     scene.add_entity(gs.morphs.Plane())
-    _add_table(scene, dr_rng, scene_dr)
+    table_entities = _add_table(scene, dr_rng, scene_dr)
 
     ycb_entities: dict[str, gs.RigidEntity] = {}
     for name, layout in YCB_LAYOUT.items():
@@ -280,6 +295,7 @@ def build_scene(
         ycb=ycb_entities,
         world_cam=world_cam,
         wrist_cam=wrist_cam,
+        table=table_entities,
         _wrist_link=wrist_link,
     )
 

@@ -9,11 +9,11 @@ A small Franka pick-and-place pipeline built on [Genesis](https://github.com/Gen
 | `scene_config.py` | Central config: table geometry, object layout, camera intrinsics/extrinsics, Franka gains, reachable workspace, and per-object appearance priors (`DR_APPEARANCE_PRIORS`) for domain randomization. |
 | `build_scene.py` | Builds the Genesis scene (table + Franka + YCB objects + cameras) and returns a `SceneBundle`. Applies M4 Layer-A domain randomization (`SceneDomainRandomizationConfig`). |
 | `grasp_demo.py` | Scripted pick-and-place state machine (IK + motion planning + force-controlled grasp), parameterized by `TaskSpec` / `GraspProfile`. |
-| `randomize.py` | Per-episode environment randomization (`EnvRandomizer.reset()`): object poses + task sampling. |
-| `record_dataset.py` | Records scripted episodes into a LeRobot dataset (success-filtered); can rebuild per appearance domain for a DR dataset. |
+| `randomize.py` | Per-episode environment randomization (`EnvRandomizer.reset()`): object poses + task sampling, plus opt-in M4 Layer-B runtime DR (friction / mass / world-cam extrinsics via `DomainRandomizationConfig`). |
+| `record_dataset.py` | Records scripted episodes into a LeRobot dataset (success-filtered); can rebuild per appearance domain (Layer A) and/or re-sample runtime physics (Layer B) for a DR dataset. |
 | `train_policy.py` | Thin wrapper around `lerobot-train` (ACT / SmolVLA presets) wired to this project's conventions. |
 | `eval_policy.py` | Policy-agnostic closed-loop evaluation of a trained lerobot policy; reports success rate. |
-| `eval_sweep.py` | Sweeps every checkpoint of a run into a success-vs-step curve; optionally across M4 appearance domains. |
+| `eval_sweep.py` | Sweeps every checkpoint of a run into a success-vs-step curve; optionally across M4 appearance domains (Layer A) and/or under runtime physics DR (Layer B). |
 | `dr_preview.py` | Renders the scene under several Layer-A appearance domains and stitches a labeled montage for visual inspection. |
 | `setup_assets.py` | Verifies/populates local assets (YCB meshes + Franka model). Runs automatically on first build. |
 | `scale_ycb.py` | Utility to bake scaled-down copies of YCB meshes (geometry only; textures preserved). |
@@ -102,9 +102,13 @@ Runs several episodes, each with randomized object poses (small position jitter 
 
 ```bash
 uv run python genesis_scene_build/randomize.py --cpu -n 8 --seed 10
+
+# with M4 Layer-B runtime DR (per-episode friction / mass / world-cam extrinsics)
+uv run python genesis_scene_build/randomize.py -n 8 --dr-runtime \
+    --dr-friction 0.6 1.4 --dr-mass 0.8 1.2 --dr-cam-pos 0.03
 ```
 
-Flags: `-n/--episodes`, `--seed`, `--jitter <m>`, `--vis`, `--cpu`.
+Flags: `-n/--episodes`, `--seed`, `--jitter <m>`, `--vis`, `--cpu`, plus Layer-B: `--dr-runtime`, `--dr-friction LO HI`, `--dr-mass LO HI`, `--dr-cam-pos <m>`, `--dr-cam-lookat <m>` (see [Domain randomization](#domain-randomization-m4)).
 
 Randomization is intentionally small-amplitude ("start small"): non-overlap is guaranteed by a slot method (each object keeps its home slot; jitter is clamped to a per-object safe radius). Pick objects are drawn from `RELIABLE_PICK_POOL`.
 
@@ -149,6 +153,9 @@ Common flags:
 | `--dr-rebuild-every` | 5 | Successful episodes per appearance domain before rebuilding. |
 | `--dr-table-jitter` / `--dr-object-color` / `--dr-fov-jitter` | 0.15 / off / 0.0 | Layer-A knobs (see [Domain randomization](#domain-randomization-m4)). |
 | `--dr-seed` | `--seed` | Base seed for the appearance-domain sequence (domain `d` uses `base + d`). |
+| `--dr-runtime` | off | Enable M4 Layer-B DR: re-sample friction/mass/world-cam extrinsics every episode. |
+| `--dr-friction` / `--dr-mass` | `0.7 1.3` / `0.8 1.2` | Layer-B friction-ratio / per-object mass-ratio ranges. |
+| `--dr-cam-pos` / `--dr-cam-lookat` | 0.0 / 0.0 | Layer-B world-cam position / lookat jitter (±m). |
 
 **Debugging failures** (`--keep-failures`): normally only successful episodes are written. With this flag, failed attempts are *also* saved, with their `task` label prefixed by `FAILED: ` (e.g. `"FAILED: pick the lemon and place it in the bowl"`). This lets you watch the failure videos to understand what went wrong. Filter them out when training, e.g. keep only episodes whose task does not start with `FAILED:`.
 
@@ -163,6 +170,14 @@ uv run python genesis_scene_build/record_dataset.py --pick 014_lemon --episodes 
 uv run python genesis_scene_build/record_dataset.py --episodes 50 \
     --dr-appearance --dr-object-color --dr-table-jitter 0.15 --dr-rebuild-every 5 \
     --repo-id genesis/banana_pick_dr --root genesis_scene_build/datasets/banana_pick_dr
+```
+
+**Physics-randomized dataset** (`--dr-runtime`): re-samples friction, per-object mass and (optionally) world-cam extrinsics *every episode* on the built scene (M4 Layer B). It is orthogonal to `--dr-appearance` and can be combined with it for appearance + physics variety in one dataset. See [Domain randomization](#domain-randomization-m4).
+
+```bash
+uv run python genesis_scene_build/record_dataset.py --episodes 50 \
+    --dr-runtime --dr-friction 0.6 1.4 --dr-mass 0.8 1.2 \
+    --repo-id genesis/banana_pick_physdr --root genesis_scene_build/datasets/banana_pick_physdr
 ```
 
 **Recorded schema** (joint-position action space):
@@ -298,6 +313,16 @@ uv run python genesis_scene_build/eval_sweep.py \
 
 Without `--dr-appearance` the sweep behaves exactly as before (single build, one domain). DR flags mirror the other scripts: `--dr-domains`, `--dr-table-jitter`, `--dr-object-color`, `--dr-fov-jitter`, `--dr-seed`.
 
+**Physics-OOD sweep** (`--dr-runtime`): score every checkpoint under M4 Layer-B runtime DR (per-episode friction / mass / world-cam extrinsics). The per-episode DR sequence is fixed across checkpoints (it re-seeds off `eval_seed + ep`), so the comparison stays fair — the curve then reflects robustness to physics variation. Combine with `--dr-appearance` for appearance + physics OOD in one sweep.
+
+```bash
+uv run python genesis_scene_build/eval_sweep.py \
+    --run-dir outputs/train/act_banana_pick_50ep_step30000 \
+    --repo-id genesis/banana_pick \
+    --dataset-root genesis_scene_build/datasets/banana_pick_50ep \
+    --episodes 20 --dr-runtime --dr-friction 0.6 1.4 --dr-mass 0.8 1.2
+```
+
 ## Domain randomization (M4)
 
 Domain randomization (DR) is organized into three layers by *where* and *when* the variation is applied:
@@ -305,7 +330,7 @@ Domain randomization (DR) is organized into three layers by *where* and *when* t
 | Layer | When | What | Status |
 |-------|------|------|--------|
 | **A** | build time (per built scene) | object color, table color, camera FOV (intrinsics) | **implemented** |
-| **B** | runtime (per episode) | friction, mass, camera extrinsics | planned |
+| **B** | runtime (per episode) | friction, mass, world-camera extrinsics | **implemented** |
 | **C** | training time (per frame) | photometric jitter (brightness/contrast/hue/…) via lerobot's built-in `--dataset.image_transforms` | via lerobot config |
 
 The split exists because the default Genesis rasterizer bakes colors/textures/intrinsics at `scene.build()` and cannot change them at runtime — so appearance/intrinsics DR must happen at build time (Layer A), while dynamics and extrinsics can be jittered per episode (Layer B).
@@ -349,6 +374,26 @@ Outputs: `eval_results/dr_preview/world_montage.png` (+ `wrist_montage.png` with
 - **`eval_sweep.py`** — sweeps `--dr-domains N` domains **domain-outer / checkpoint-inner**, so every checkpoint is scored on the identical set of domains (fair comparison); reports the per-checkpoint mean plus per-domain curves.
 
 Recommendation: `--dr-object-color` is the most aggressive knob (it discards the realistic YCB texture), so consider leaving it off — randomize the nuisances (table + FOV) at Layer A and get object-appearance variety from Layer C photometric jitter at training time.
+
+### Layer B knobs
+
+Configured by `DomainRandomizationConfig` (in `randomize.py`) and applied inside `EnvRandomizer.reset()`, so the domain is re-sampled **every episode** on the already-built scene. Enabled with `--dr-runtime`; exposed as `--dr-*` flags on `randomize.py`, `record_dataset.py`, and `eval_sweep.py`:
+
+| Knob | Flag | Notes |
+|------|------|-------|
+| Friction | `--dr-friction LO HI` | One multiplicative ratio per episode, applied to the object(s), the Franka links **and** the tabletop. Contact friction is `max()` over the pair, so every relevant surface is scaled by the same ratio — otherwise scaling only the object would be masked by the (unchanged) fingers/table. Default `0.7 1.3`. |
+| Mass | `--dr-mass LO HI` | Per-object multiplicative mass ratio (converted to an additive `set_mass_shift` from each object's captured base mass). A *ratio* — not an absolute ±kg shift — keeps light YCB objects strictly positive; a fixed kg shift can drive a ~30 g object negative and diverge the solver to NaN. Default `0.8 1.2`. |
+| World-cam extrinsics | `--dr-cam-pos <m>` / `--dr-cam-lookat <m>` | ±`m` per-axis jitter on the world camera's position / lookat point (`set_pose`). `0` disables (opt-in). |
+
+The robot's own mass is left fixed (so the tuned kp/kv stay valid), and the **wrist** camera's extrinsics are intentionally *not* jittered: it is eye-in-hand and re-derived every step via `move_to_attach()`, so perturbing it needs re-attach plumbing and is deferred.
+
+### Where Layer B is wired in
+
+- **`randomize.py`** — `--dr-runtime` runs the self-test episodes under runtime DR (quick verification / tuning of the ranges).
+- **`record_dataset.py`** — `--dr-runtime` re-samples friction/mass/camera every episode while recording, composing with (and orthogonal to) the Layer-A appearance rebuilds.
+- **`eval_sweep.py`** — `--dr-runtime` scores every checkpoint under runtime DR. Because the randomizer re-seeds off `eval_seed + ep`, the per-episode DR sequence is **identical across checkpoints** (and, with `--dr-appearance`, within each appearance domain), so the comparison stays fair.
+
+Layers A and B are orthogonal and can be combined: `--dr-appearance … --dr-runtime …` gives appearance-OOD + physics-OOD in the same run.
 
 ## Object grasp reliability
 

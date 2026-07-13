@@ -18,6 +18,11 @@ Usage:
         --repo-id genesis/banana_pick \
         --dataset-root genesis_scene_build/datasets/banana_pick_50ep \
         --episodes 20 --pick 011_banana
+
+    # M4 Layer-B: robustness to runtime physics DR (per-episode friction/mass), fixed
+    # across checkpoints. Combine with --dr-appearance for appearance + physics OOD.
+    uv run python genesis_scene_build/eval_sweep.py --run-dir ... --repo-id ... \
+        --episodes 20 --dr-runtime --dr-friction 0.6 1.4 --dr-mass 0.8 1.2
 """
 
 from __future__ import annotations
@@ -42,6 +47,7 @@ import genesis as gs
 
 from build_scene import SceneDomainRandomizationConfig, build_scene
 from eval_policy import evaluate_policy, load_policy
+from randomize import DomainRandomizationConfig, EnvRandomizer, RandomizationConfig
 
 
 def _make_scene_dr(args: argparse.Namespace, domain_index: int) -> SceneDomainRandomizationConfig:
@@ -64,6 +70,22 @@ def _make_scene_dr(args: argparse.Namespace, domain_index: int) -> SceneDomainRa
 def _build(args: argparse.Namespace, scene_dr: SceneDomainRandomizationConfig | None):
     return build_scene(
         show_viewer=args.vis, n_envs=1, add_world_cam=True, add_wrist_cam=True, scene_dr=scene_dr
+    )
+
+
+def _make_runtime_dr(args: argparse.Namespace) -> DomainRandomizationConfig:
+    """M4 Layer-B config: per-episode runtime friction / mass / world-cam extrinsics.
+
+    Enabled -> the sweep's ``EnvRandomizer`` re-samples physics/camera every episode. Since the
+    randomizer re-seeds off ``seed + ep`` each reset, every checkpoint sees the identical DR
+    sequence within a domain, so the comparison stays fair.
+    """
+    return DomainRandomizationConfig(
+        enabled=args.dr_runtime,
+        friction_ratio_range=tuple(args.dr_friction),
+        mass_ratio_range=tuple(args.dr_mass),
+        cam_pos_jitter=args.dr_cam_pos,
+        cam_lookat_jitter=args.dr_cam_lookat,
     )
 
 
@@ -177,6 +199,36 @@ def main() -> None:
         default=None,
         help="Base seed for the appearance-domain sequence (default: --seed). Domain d uses base + d.",
     )
+    # -- M4 Layer-B domain randomization (per-episode runtime physics / camera extrinsics) --
+    parser.add_argument(
+        "--dr-runtime",
+        action="store_true",
+        help="Evaluate under M4 Layer-B runtime DR: friction/mass/world-cam extrinsics are "
+        "re-sampled every episode. Orthogonal to --dr-appearance; the per-episode DR sequence "
+        "is fixed across checkpoints so the sweep stays a fair comparison.",
+    )
+    parser.add_argument(
+        "--dr-friction",
+        type=float,
+        nargs=2,
+        metavar=("LO", "HI"),
+        default=(0.7, 1.3),
+        help="Layer-B: friction-ratio range (shared across object/finger/table).",
+    )
+    parser.add_argument(
+        "--dr-mass",
+        type=float,
+        nargs=2,
+        metavar=("LO", "HI"),
+        default=(0.8, 1.2),
+        help="Layer-B: per-object multiplicative mass-ratio range.",
+    )
+    parser.add_argument(
+        "--dr-cam-pos", type=float, default=0.0, help="Layer-B: world-cam position jitter (+/- m)."
+    )
+    parser.add_argument(
+        "--dr-cam-lookat", type=float, default=0.0, help="Layer-B: world-cam lookat jitter (+/- m)."
+    )
     args = parser.parse_args()
 
     run_dir = Path(args.run_dir)
@@ -190,6 +242,14 @@ def main() -> None:
     n_domains = args.dr_domains if args.dr_appearance else 1
     if args.dr_appearance:
         print(f"[sweep] appearance DR: {n_domains} domain(s), domain-outer / checkpoint-inner")
+
+    runtime_dr = _make_runtime_dr(args)
+    if args.dr_runtime:
+        print(
+            f"[sweep] runtime DR (Layer B) on: friction={runtime_dr.friction_ratio_range} "
+            f"mass_ratio={runtime_dr.mass_ratio_range} cam_pos={runtime_dr.cam_pos_jitter} "
+            f"cam_lookat={runtime_dr.cam_lookat_jitter}"
+        )
 
     backend = gs.cpu if args.cpu else gs.gpu
     gs.init(backend=backend)
@@ -215,6 +275,15 @@ def main() -> None:
         if args.dr_appearance:
             print(f"\n[sweep] ===== appearance domain {d} (scene_seed={scene_seed}, eval_seed={eval_seed}) =====")
 
+        # One randomizer per (rebuilt) bundle. Layer-B runtime DR lives in its config; because
+        # reset() re-seeds off eval_seed+ep, the per-episode physics/camera sequence is identical
+        # across checkpoints within this domain -> fair comparison. When runtime DR is off this
+        # is behaviorally identical to evaluate_policy's default randomizer.
+        randomizer = EnvRandomizer(
+            bundle,
+            RandomizationConfig(pos_jitter=args.jitter, randomize_pick=False, seed=eval_seed, dr=runtime_dr),
+        )
+
         domain_rows: list[dict] = []
         for step, pm in checkpoints:
             label = f"dom{d}:step{step}" if args.dr_appearance else str(step)
@@ -230,6 +299,7 @@ def main() -> None:
                 tol=args.tol,
                 no_task=args.no_task,
                 jitter=args.jitter,
+                randomizer=randomizer,
                 label=label,
             )
             agg[step]["n_success"] += res["n_success"]
@@ -273,6 +343,11 @@ def main() -> None:
             "dr_object_color": args.dr_object_color,
             "dr_fov_jitter": args.dr_fov_jitter,
             "dr_seed_base": (args.dr_seed if args.dr_seed is not None else args.seed) if args.dr_appearance else None,
+            "dr_runtime": args.dr_runtime,
+            "dr_friction": list(args.dr_friction) if args.dr_runtime else None,
+            "dr_mass_ratio": list(args.dr_mass) if args.dr_runtime else None,
+            "dr_cam_pos_jitter": args.dr_cam_pos if args.dr_runtime else None,
+            "dr_cam_lookat_jitter": args.dr_cam_lookat if args.dr_runtime else None,
             "timestamp": datetime.now().isoformat(timespec="seconds"),
         },
         "aggregate": rows,

@@ -17,6 +17,10 @@ Usage:
     # M4 Layer-A: appearance-randomized dataset, new domain every 5 successful episodes
     uv run python genesis_scene_build/record_dataset.py --episodes 50 \
         --dr-appearance --dr-object-color --dr-table-jitter 0.15 --dr-rebuild-every 5
+
+    # M4 Layer-B: per-episode runtime physics DR (friction/mass), optionally with Layer A
+    uv run python genesis_scene_build/record_dataset.py --episodes 50 \
+        --dr-runtime --dr-friction 0.6 1.4 --dr-mass 0.8 1.2
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
 from build_scene import SceneDomainRandomizationConfig, build_scene
 from grasp_demo import TaskSpec, run_pick_place
-from randomize import EnvRandomizer, RandomizationConfig
+from randomize import DomainRandomizationConfig, EnvRandomizer, RandomizationConfig
 
 # The sim runs at dt=0.01 (see build_scene): 100 control steps per second.
 CONTROL_FPS = 100
@@ -171,6 +175,28 @@ def _build(args: argparse.Namespace, scene_dr: SceneDomainRandomizationConfig):
     )
 
 
+def _make_runtime_dr(args: argparse.Namespace) -> DomainRandomizationConfig:
+    """M4 Layer-B config: per-episode runtime friction / mass / world-cam extrinsics.
+
+    Applied inside ``EnvRandomizer.reset()`` on the built scene, so it composes with (and is
+    orthogonal to) the Layer-A appearance domain. Disabled -> inert, matching prior behavior.
+    """
+    return DomainRandomizationConfig(
+        enabled=args.dr_runtime,
+        friction_ratio_range=tuple(args.dr_friction),
+        mass_ratio_range=tuple(args.dr_mass),
+        cam_pos_jitter=args.dr_cam_pos,
+        cam_lookat_jitter=args.dr_cam_lookat,
+    )
+
+
+def _make_randomizer(bundle, args: argparse.Namespace) -> EnvRandomizer:
+    return EnvRandomizer(
+        bundle,
+        RandomizationConfig(randomize_pick=False, seed=args.seed, dr=_make_runtime_dr(args)),
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Record scripted pick-and-place into a LeRobotDataset.")
     parser.add_argument("-c", "--cpu", action="store_true", default=False)
@@ -227,6 +253,34 @@ def main() -> None:
         default=None,
         help="Base seed for the appearance-domain sequence (default: --seed). Domain d uses base + d.",
     )
+    # -- M4 Layer-B domain randomization (per-episode runtime physics / camera extrinsics) --
+    parser.add_argument(
+        "--dr-runtime",
+        action="store_true",
+        help="Enable M4 Layer-B DR: re-sample friction/mass/world-cam extrinsics every episode.",
+    )
+    parser.add_argument(
+        "--dr-friction",
+        type=float,
+        nargs=2,
+        metavar=("LO", "HI"),
+        default=(0.7, 1.3),
+        help="Layer-B: friction-ratio range (shared across object/finger/table).",
+    )
+    parser.add_argument(
+        "--dr-mass",
+        type=float,
+        nargs=2,
+        metavar=("LO", "HI"),
+        default=(0.8, 1.2),
+        help="Layer-B: per-object multiplicative mass-ratio range.",
+    )
+    parser.add_argument(
+        "--dr-cam-pos", type=float, default=0.0, help="Layer-B: world-cam position jitter (+/- m)."
+    )
+    parser.add_argument(
+        "--dr-cam-lookat", type=float, default=0.0, help="Layer-B: world-cam lookat jitter (+/- m)."
+    )
     args = parser.parse_args()
 
     img_wh = (args.img_width, args.img_height)
@@ -262,7 +316,7 @@ def main() -> None:
     # Randomize object poses each episode. The pick object is sampled here (not by the
     # randomizer) so we can restrict it to the requested --pick list and set a matching
     # per-episode task string.
-    randomizer = EnvRandomizer(bundle, RandomizationConfig(randomize_pick=False, seed=args.seed))
+    randomizer = _make_randomizer(bundle, args)
     recorder = EpisodeRecorder(bundle, fps=args.fps, img_wh=img_wh)
     pick_rng = np.random.default_rng(args.seed)
     pick_choices = list(args.pick)
@@ -279,7 +333,7 @@ def main() -> None:
             gs.destroy()
             gs.init(backend=backend)
             bundle = _build(args, scene_dr)
-            randomizer = EnvRandomizer(bundle, RandomizationConfig(randomize_pick=False, seed=args.seed))
+            randomizer = _make_randomizer(bundle, args)
             recorder = EpisodeRecorder(bundle, fps=args.fps, img_wh=img_wh)
             print(f"[record] rebuilt scene for appearance domain {domain_index} (seed={scene_dr.seed})")
 
