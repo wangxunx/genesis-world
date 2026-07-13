@@ -395,6 +395,34 @@ The robot's own mass is left fixed (so the tuned kp/kv stay valid), and the **wr
 
 Layers A and B are orthogonal and can be combined: `--dr-appearance … --dr-runtime …` gives appearance-OOD + physics-OOD in the same run.
 
+### Layer C (training-time photometric augmentation)
+
+Layer C is **not implemented in this repo** — it is lerobot's built-in per-frame image augmentation (`ImageTransformsConfig` in `lerobot/datasets/transforms.py`), applied by the data loader during training. There is nothing to add here; you only need to **enable** it, since it is **off by default** (`enable: bool = False`). `train_policy.py` forwards anything after `--` verbatim to `lerobot-train`, so enable it there:
+
+```bash
+# ACT with Layer-C photometric jitter on (uses lerobot's default transform set)
+uv run python genesis_scene_build/train_policy.py act \
+    --repo-id genesis/banana_pick \
+    --dataset-root genesis_scene_build/datasets/banana_pick_50ep \
+    --steps 20000 -- \
+    --dataset.image_transforms.enable=true
+
+# Optionally tune how many transforms are stacked per frame and the ordering
+uv run python genesis_scene_build/train_policy.py act \
+    --repo-id genesis/banana_pick \
+    --dataset-root genesis_scene_build/datasets/banana_pick_50ep -- \
+    --dataset.image_transforms.enable=true \
+    --dataset.image_transforms.max_num_transforms=3 \
+    --dataset.image_transforms.random_order=true
+```
+
+When enabled, lerobot samples up to `max_num_transforms` (default `3`) from its default set — `brightness`, `contrast`, `saturation`, `hue`, `sharpness`, `affine` (torchvision `ColorJitter` / `SharpnessJitter` / `RandomAffine`) — and applies them per frame. This is the right place to get **object-appearance and lighting-like variety** cheaply, which is why Layer A leaves object recolor as an aggressive opt-in and does no lighting at all.
+
+Notes:
+
+- It only augments the **images**, not the state/action; and only at **training** time — eval (`eval_policy.py` / `eval_sweep.py`) renders clean frames from the sim, so it is unaffected.
+- The transform amplitudes live in lerobot's config (`tfs[...].kwargs`, e.g. `hue: (-0.05, 0.05)`); overriding those nested dict values from the CLI is awkward, so if you need custom amplitudes it's cleanest to edit a config file / preset rather than pass them as flags.
+
 ## Object grasp reliability
 
 The scripted parallel-jaw grasp is reliable for the banana (~100%) and moderately reliable (~50%) for the near-spherical `lemon`/`plum` at realistic friction. Round objects (`apple`, `orange`, `pear`) and the `mug` are not reliably graspable and are disabled by default. For clean data generation, keep to the banana (or rely on the success filter).
