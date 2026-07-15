@@ -35,6 +35,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -43,9 +44,24 @@ _ROOT = Path(__file__).resolve().parent
 
 # Per-preset defaults. `type` -> `--policy.type=<t>` (train from scratch);
 # `path` -> `--policy.path=<p>` (fine-tune from a pretrained checkpoint/base).
+#
+# `rename_map` (optional): maps this project's dataset image keys to the keys the
+# pretrained policy expects. SmolVLA's base (`lerobot/smolvla_base`) is trained
+# with canonical camera keys `observation.images.camera{1,2,3}`, but our datasets
+# use `world` / `wrist`. lerobot bakes this rename into the *saved* preprocessor
+# (a `rename_observations_processor`), so eval_policy.py needs no change -- it can
+# keep feeding `world`/`wrist` and the checkpoint renames them internally. ACT has
+# no such constraint (it adapts its input features to the dataset), so no rename.
 PRESETS: dict[str, dict] = {
     "act": {"policy_arg": ("type", "act"), "batch_size": 8},
-    "smolvla": {"policy_arg": ("path", "lerobot/smolvla_base"), "batch_size": 4},
+    "smolvla": {
+        "policy_arg": ("path", "lerobot/smolvla_base"),
+        "batch_size": 4,
+        "rename_map": {
+            "observation.images.world": "observation.images.camera1",
+            "observation.images.wrist": "observation.images.camera2",
+        },
+    },
 }
 
 
@@ -86,6 +102,17 @@ def build_command(args: argparse.Namespace, passthrough: list[str]) -> list[str]
     # override in `passthrough` takes precedence (appended after, last wins).
     if args.video_backend:
         cmd.append(f"--dataset.video_backend={args.video_backend}")
+
+    # Camera-key rename (see PRESETS docstring). Explicit --rename-map wins; else
+    # fall back to the preset default unless the user already passed one through.
+    passthrough_has_rename = any(p.startswith("--rename_map") for p in passthrough)
+    if args.rename_map is not None:
+        cmd.append(f"--rename_map={args.rename_map}")
+    elif not passthrough_has_rename:
+        preset_rename = PRESETS[args.policy].get("rename_map")
+        if preset_rename:
+            cmd.append(f"--rename_map={json.dumps(preset_rename)}")
+
     cmd += passthrough
     return cmd
 
@@ -119,6 +146,13 @@ def main() -> None:
     )
     parser.add_argument("--wandb", action="store_true", help="Enable Weights & Biases logging.")
     parser.add_argument("--push-to-hub", action="store_true", help="Push the trained policy to the HF Hub.")
+    parser.add_argument(
+        "--rename-map",
+        default=None,
+        help="JSON dict mapping dataset image keys to the policy's expected keys "
+        "(forwarded as lerobot --rename_map). Overrides the preset default; pass '{}' to disable. "
+        "The smolvla preset auto-maps world/wrist -> camera1/camera2.",
+    )
     parser.add_argument(
         "--policy-type",
         default=None,

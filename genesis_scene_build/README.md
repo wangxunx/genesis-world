@@ -54,6 +54,24 @@ uv run python genesis_scene_build/setup_assets.py
 
 > **Tip:** `uv run <script>` re-syncs the environment on every call. To skip that, call the venv Python directly: `./.venv/bin/python genesis_scene_build/<script>.py ...`
 
+### SmolVLA dependencies (optional)
+
+The `smolvla` training preset fine-tunes `lerobot/smolvla_base`, which needs lerobot's SmolVLA extra (adds `transformers` + `num2words`):
+
+```bash
+uv pip install "lerobot[smolvla]==0.4.4"   # pinned to the installed lerobot version
+```
+
+The first SmolVLA run downloads `lerobot/smolvla_base` (~0.9 GB) plus its `HuggingFaceTB/SmolVLM2-500M-Video-Instruct` VLM backbone into the HuggingFace cache. If the default `~/.cache/huggingface` is not writable (e.g. a stale **root-owned** model dir left by an earlier `sudo`/Docker run), redirect the cache to a writable dir and pre-download once:
+
+```bash
+export HF_HOME="$PWD/.hf_cache"
+uv run python -c "from huggingface_hub import snapshot_download as d; \
+    d('HuggingFaceTB/SmolVLM2-500M-Video-Instruct'); d('lerobot/smolvla_base')"
+```
+
+Keep `HF_HOME` set (and optionally `HF_HUB_OFFLINE=1`) for later train/eval so they reuse the local cache offline.
+
 ## The scene
 
 - **Table**: built from box primitives; top surface at `z = 0.75 m`.
@@ -235,6 +253,35 @@ uv run python genesis_scene_build/train_policy.py act --repo-id genesis/banana_p
 
 To train an arbitrary lerobot policy instead of a preset, use `--policy-type <t>` (from scratch) or `--policy-path <ckpt>` (fine-tune).
 
+### SmolVLA fine-tuning notes
+
+SmolVLA is a vision-language-action model, so it pays off most on the **multi-task** dataset where the language instruction disambiguates the target — fine-tune it on the merged `fruit_pick_150ep` (banana / lemon / plum, built with `aggregate_datasets.py`):
+
+```bash
+export HF_HOME="$PWD/.hf_cache"
+CUDA_VISIBLE_DEVICES=<free-gpu> HF_HUB_OFFLINE=1 \
+uv run python genesis_scene_build/train_policy.py smolvla \
+    --repo-id genesis/fruit_pick_150ep \
+    --dataset-root genesis_scene_build/datasets/fruit_pick_150ep \
+    --steps 30000 --save-freq 2000 --batch-size 8
+```
+
+- **Camera-key rename (automatic).** `lerobot/smolvla_base` expects canonical camera keys `observation.images.camera1/2/3`, but this project's datasets use `world` / `wrist`. The `smolvla` preset injects `--rename_map` (`world→camera1`, `wrist→camera2`), which lerobot bakes into the saved preprocessor — so `eval_policy.py` needs no extra flags; it auto-recovers the map from the checkpoint's `train_config.json`. Override with `--rename-map '{...}'` (or `'{}'` to disable). SmolVLA's unused third camera is left empty (`empty_cameras=0`), which it handles natively.
+- **Steps.** `--steps 30000` matches SmolVLA's `scheduler_decay_steps`; fewer steps only trigger a harmless LR auto-rescale warning. The vision encoder is frozen and only the ~100 M-param action expert trains, so batch 8 uses just ~4 GB on a 32 GB card here (raise `--batch-size` if you have headroom).
+- **ROCm / bf16.** Verified on `torch 2.9.1+rocm7.2.1` (AMD Radeon AI PRO R9700, bf16-capable). Keep the default `--video-backend pyav`. `PYTORCH_HIP_ALLOC_CONF=expandable_segments:True` is unsupported on this build (no-op, harmless).
+- **Picking a GPU on a shared box.** torch and `rocm-smi` can enumerate GPUs in *different* orders. Choose the idle card with `CUDA_VISIBLE_DEVICES=<n>` where `<n>` is the **torch** index (check with `uv run python -c "import torch;[print(i, torch.cuda.mem_get_info(i)[0]/1e9) for i in range(torch.cuda.device_count())]"`), then confirm the job lands on an idle card via `rocm-smi --showmeminfo vram`. For multi-hour runs, launch detached (`nohup setsid … &`) so training survives your shell session closing.
+
+**Observed results** (fine-tune from `smolvla_base`, 30k steps, batch 8, ~1 h 26 m on a single R9700; train loss ~0.18 → <0.1). Closed-loop eval on the final checkpoint, 30 episodes with one fruit sampled per episode:
+
+| Task | Success |
+|------|---------|
+| `011_banana` | 5/12 = 42% |
+| `014_lemon` | 5/8 = 63% |
+| `018_plum` | 8/10 = 80% |
+| **Overall** | **18/30 = 60%** |
+
+Successful grasps complete in ~150–180 control steps; failures exhaust the 450-step budget. The banana (elongated) is the hardest target, the plum (near-sphere) the easiest — consistent with the adaptive-grasp geometry. (For a fair learning curve or an ACT-vs-SmolVLA comparison on this multi-task set, run `eval_sweep.py` over the saved checkpoints, and/or train an ACT baseline on the same `fruit_pick_150ep` dataset — both optional.)
+
 ## Evaluate a trained policy (`eval_policy.py`)
 
 `eval_policy.py` runs a **trained lerobot policy** closed-loop in the same Genesis scene and reports a success rate. It is **policy-agnostic**: ACT, SmolVLA (or any other lerobot policy) are loaded through the same generic path, so switching policy only means pointing `--policy-path` at a different checkpoint.
@@ -253,6 +300,15 @@ uv run python genesis_scene_build/eval_policy.py \
     --repo-id genesis/banana_pick \
     --dataset-root genesis_scene_build/datasets/banana_pick_50ep \
     --episodes 20 --save-video
+
+# SmolVLA multi-task — per-object breakdown across the three fruit
+export HF_HOME="$PWD/.hf_cache"
+CUDA_VISIBLE_DEVICES=<free-gpu> HF_HUB_OFFLINE=1 \
+uv run python genesis_scene_build/eval_policy.py \
+    --policy-path outputs/train/smolvla_fruit_pick_150ep/checkpoints/last/pretrained_model \
+    --repo-id genesis/fruit_pick_150ep \
+    --dataset-root genesis_scene_build/datasets/fruit_pick_150ep \
+    --episodes 30 --pick 011_banana 014_lemon 018_plum
 ```
 
 How it works (thin layers, no per-policy branching):

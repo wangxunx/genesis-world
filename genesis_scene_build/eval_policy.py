@@ -99,6 +99,25 @@ class PolicyBundle:
         return action.detach().cpu().numpy().reshape(-1).astype(np.float32)
 
 
+def _load_rename_map(policy_path: str) -> dict:
+    """Best-effort recovery of the training-time camera rename_map from a checkpoint.
+
+    Policies fine-tuned from a base with canonical camera keys (e.g. SmolVLA's
+    ``camera1/2/3``) are trained with a ``rename_map`` that is baked into the saved
+    preprocessor, so at inference the raw dataset keys (``world``/``wrist``) are
+    renamed transparently. ``make_policy``'s feature-consistency check, however,
+    must be given the same map or it rejects the raw keys. We read it back from the
+    checkpoint's ``train_config.json`` so eval needs no extra flags.
+    """
+    p = Path(policy_path) / "train_config.json"
+    if p.is_file():
+        try:
+            return json.loads(p.read_text()).get("rename_map") or {}
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
 def load_policy(
     policy_path: str,
     repo_id: str,
@@ -106,6 +125,7 @@ def load_policy(
     device_str: str,
     *,
     use_amp: bool = False,
+    rename_map: dict | None = None,
 ) -> PolicyBundle:
     """Generically load any lerobot policy checkpoint for closed-loop inference.
 
@@ -121,7 +141,15 @@ def load_policy(
     cfg.pretrained_path = policy_path
     cfg.device = str(device)
 
-    policy = make_policy(cfg=cfg, ds_meta=ds_meta)
+    # Recover the training-time camera rename (if any). Passing it to make_policy
+    # both skips the raw-key feature-consistency check and matches how the model was
+    # trained; the rename itself is already baked into the loaded preprocessor.
+    if rename_map is None:
+        rename_map = _load_rename_map(policy_path)
+    if rename_map:
+        print(f"[eval] camera rename_map: {rename_map}")
+
+    policy = make_policy(cfg=cfg, ds_meta=ds_meta, rename_map=rename_map)
     policy.eval()
 
     preprocessor, postprocessor = make_pre_post_processors(
@@ -412,6 +440,12 @@ def main() -> None:
     parser.add_argument("--dataset-root", default=None, help="Local dataset dir (for feature shapes/stats/fps).")
     parser.add_argument("--device", default="cuda", help="cuda | cpu | mps (auto-falls back if unavailable).")
     parser.add_argument("--use-amp", action="store_true", help="Enable autocast on CUDA inference.")
+    parser.add_argument(
+        "--rename-map",
+        default=None,
+        help="JSON dict mapping dataset image keys to the policy's expected keys. "
+        "Default: auto-recovered from the checkpoint's train_config.json (e.g. SmolVLA world/wrist -> camera1/camera2).",
+    )
     parser.add_argument("-c", "--cpu", action="store_true", help="Run the Genesis sim on CPU backend.")
     parser.add_argument("-v", "--vis", action="store_true", help="Show the Genesis viewer.")
     parser.add_argument("--episodes", type=int, default=10, help="Number of eval episodes.")
@@ -441,12 +475,14 @@ def main() -> None:
     gs.init(backend=gs.cpu if args.cpu else gs.gpu)
     bundle = build_scene(show_viewer=args.vis, n_envs=1, add_world_cam=True, add_wrist_cam=True)
 
+    rename_map = json.loads(args.rename_map) if args.rename_map else None
     pb = load_policy(
         args.policy_path,
         args.repo_id,
         args.dataset_root,
         args.device,
         use_amp=args.use_amp,
+        rename_map=rename_map,
     )
 
     video_dir = Path(args.video_dir) if args.video_dir else _ROOT / "eval_videos" / repo_name
