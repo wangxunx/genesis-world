@@ -44,6 +44,10 @@ PREGRASP_CLEARANCE = 0.18  # hand-link height above object centroid before desce
 LIFT_HAND_Z = TABLE_TOP_Z + 0.30  # absolute world z to lift the hand to after grasping
 RETREAT_HAND_Z = TABLE_TOP_Z + 0.35  # absolute world z to retreat to after releasing
 PLACE_HAND_Z_ABOVE_TARGET = 0.16  # hand-link height above the place reference z when releasing
+# For container (bowl) placement success: how far below the rim the object's lowest
+# point must drop to count as "inside", so a resting object clearly dips in rather than
+# grazing the rim. Kept small since an elongated object (banana) only partly sinks.
+_BOWL_RIM_MARGIN = 0.01
 
 # Vertical offset from the hand-link origin (the IK target) down to the fingertip midline.
 # Used by the geometry-adaptive grasp height to line the fingertips up with an object's center.
@@ -104,7 +108,7 @@ class TaskSpec:
 
     pick_object: str
     place_target: PlaceTarget
-    success_tol: float = 0.08
+    success_tol: float = 0.06
 
     def grasp_profile(self) -> GraspProfile:
         return GRASP_PROFILES.get(self.pick_object, DEFAULT_PROFILE)
@@ -325,11 +329,42 @@ def run_pick_place(bundle, task: TaskSpec, *, save_frames: bool = False, recorde
 
 
 def check_success(bundle, task: TaskSpec) -> bool:
-    pick_pos = bundle.ycb[task.pick_object].get_pos().cpu().numpy().reshape(-1)
-    place_xy, place_ref_z, _ = _resolve_place(bundle, task.place_target)
+    """Whether ``pick_object`` has been placed at the target.
+
+    For a *container* target (e.g. the bowl) success requires the object to actually
+    be **inside** it -- horizontally within the rim footprint *and* with its lowest
+    point dropped below the rim -- rather than merely hovering above the target xy
+    (which the old "within tol and above table" test wrongly accepted, e.g. while
+    still gripped over the bowl). We test the object's bottom (AABB) rather than its
+    center because an elongated object such as the banana cannot fully sink below the
+    rim: it rests partly in the bowl with its center/top still above the rim, yet its
+    bottom clearly dips inside. For a bare tabletop coordinate target we keep the
+    original test.
+
+    Note: this is an instantaneous spatial test. Callers that poll it every frame
+    (closed-loop eval) should additionally require it to hold for a short dwell so
+    success is only declared once the object has come to rest (see eval_policy.py).
+    """
+    obj = bundle.ycb[task.pick_object]
+    pick_pos = obj.get_pos().cpu().numpy().reshape(-1)
+    place_xy, place_ref_z, place_ent = _resolve_place(bundle, task.place_target)
     horizontal = float(np.linalg.norm(pick_pos[:2] - place_xy))
-    # Object should be within tolerance of the target xy and resting at/above the reference.
-    return bool(horizontal < task.success_tol and pick_pos[2] > place_ref_z - 0.02)
+
+    if place_ent is None:
+        # Tabletop coordinate target: object near the xy and resting at/above the table.
+        return bool(horizontal < task.success_tol and pick_pos[2] > place_ref_z - 0.02)
+
+    # Container target: require containment inside the bowl's world-frame AABB.
+    bowl_aabb = _entity_aabb(place_ent)  # (2, 3): row 0 = min, row 1 = max
+    rim_z = float(bowl_aabb[1, 2])
+    rim_radius = 0.5 * float(min(bowl_aabb[1, 0] - bowl_aabb[0, 0], bowl_aabb[1, 1] - bowl_aabb[0, 1]))
+    within_footprint = horizontal < min(task.success_tol, rim_radius)
+    obj_bottom_z = float(_entity_aabb(obj)[0, 2])
+    # Lowest point of the object has dropped below the rim (by a small margin so it is
+    # clearly inside, not just grazing the edge). This accepts a banana lying partly in
+    # the bowl while rejecting an object still hovering/gripped above it.
+    inside_bowl = obj_bottom_z < rim_z - _BOWL_RIM_MARGIN
+    return bool(within_footprint and inside_bowl)
 
 
 def _parse_place(text: str) -> PlaceTarget:
@@ -350,7 +385,7 @@ def main() -> None:
         default="024_bowl",
         help="Place target: an object name (e.g. 024_bowl) or tabletop coords 'x,y'.",
     )
-    parser.add_argument("--tol", type=float, default=0.08, help="Success tolerance (m).")
+    parser.add_argument("--tol", type=float, default=0.06, help="Success tolerance (m).")
     parser.add_argument("--save-frames", action="store_true", help="Save world-cam frames per stage.")
     args = parser.parse_args()
 

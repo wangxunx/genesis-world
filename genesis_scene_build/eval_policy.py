@@ -66,6 +66,11 @@ from record_dataset import CONTROL_FPS, task_description
 
 STATE_KEY = "observation.state"
 
+# After success is declared, keep recording (and holding the last action) for this long
+# so the saved video shows the object resting in the bowl instead of cutting off the
+# instant placement is confirmed. Purely cosmetic: does not affect success/step counts.
+POST_SUCCESS_SECONDS = 0.8
+
 
 @dataclass
 class PolicyBundle:
@@ -254,6 +259,12 @@ def run_episode(
 
     result = EpisodeResult(success=False)
     accum = 0.0
+    # Require the (containment) success condition to hold for a short dwell (~0.4 s)
+    # before declaring success, so we only stop once the object has actually come to
+    # rest inside the bowl -- not during the fly-by/descent. This also keeps the
+    # recorded video running through the settle, so the placement is visible.
+    settle_frames = max(1, int(round(0.4 * pb.fps)))
+    success_streak = 0
     for _ in range(max_frames):
         obs = build_observation(bundle, pb)
         if record_video:
@@ -267,25 +278,56 @@ def run_episode(
         apply_action(bundle, action, max(1, n_sub))
         result.n_policy_steps += 1
 
-        # Early stop once the object is in the bowl and settled.
         if check_success(bundle, task):
-            result.success = True
-            break
+            success_streak += 1
+            if success_streak >= settle_frames:
+                result.success = True
+                break
+        else:
+            success_streak = 0
 
     if not result.success:
         result.success = check_success(bundle, task)
+
+    # Cosmetic tail: after a successful placement, hold the last action and keep
+    # recording for a short window so the resting object is clearly visible in the video.
+    if result.success and record_video:
+        hold_frames = max(1, int(round(POST_SUCCESS_SECONDS * pb.fps)))
+        for _ in range(hold_frames):
+            apply_action(bundle, action, max(1, int(round(steps_per_frame))))
+            obs = build_observation(bundle, pb)
+            result.frames.append(obs[pb.image_keys[0]].copy())
+
     return result
 
 
 def _save_video(frames: list[np.ndarray], path: Path, fps: int) -> None:
+    """Write an H.264 (yuv420p) mp4 so the file plays in browsers / VSCode's viewer.
+
+    The old cv2 ``mp4v`` (MPEG-4 Part 2) codec is not decodable by the HTML5 video
+    player VSCode uses, so we encode with libx264 via imageio-ffmpeg. H.264 + yuv420p
+    also requires even frame dimensions, so odd width/height are cropped by one pixel.
+    """
     if not frames:
         return
+    import imageio.v2 as imageio
+
     path.parent.mkdir(parents=True, exist_ok=True)
     h, w = frames[0].shape[:2]
-    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h))
-    for f in frames:
-        writer.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))
-    writer.release()
+    h_even, w_even = h - (h % 2), w - (w % 2)
+    writer = imageio.get_writer(
+        str(path),
+        fps=fps,
+        codec="libx264",
+        format="ffmpeg",
+        pixelformat="yuv420p",
+        macro_block_size=None,
+    )
+    try:
+        for f in frames:
+            writer.append_data(np.ascontiguousarray(f[:h_even, :w_even]))
+    finally:
+        writer.close()
 
 
 def evaluate_policy(
@@ -297,7 +339,7 @@ def evaluate_policy(
     max_seconds: float = 15.0,
     pick: list[str] | tuple[str, ...] = ("011_banana",),
     place: str = "024_bowl",
-    tol: float = 0.08,
+    tol: float = 0.06,
     no_task: bool = False,
     jitter: float = 0.03,
     randomizer: EnvRandomizer | None = None,
@@ -458,7 +500,7 @@ def main() -> None:
         help="Object(s) to evaluate on; one is sampled per episode.",
     )
     parser.add_argument("--place", default="024_bowl", help="Place target object name.")
-    parser.add_argument("--tol", type=float, default=0.08, help="Success tolerance (m).")
+    parser.add_argument("--tol", type=float, default=0.06, help="Success tolerance (m).")
     parser.add_argument("--no-task", action="store_true", help="Send an empty task string (ignore language conditioning).")
     parser.add_argument("--jitter", type=float, default=0.03, help="Per-episode object position jitter (m).")
     parser.add_argument("--save-video", action="store_true", help="Save the world-cam rollout of each episode to mp4.")

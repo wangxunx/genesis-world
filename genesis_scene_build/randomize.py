@@ -119,7 +119,7 @@ class RandomizationConfig:
     randomize_place: bool = False  # if True, sometimes place onto a random tabletop xy
     place_tabletop_prob: float = 0.0  # P(tabletop target) when randomize_place is True
     settle_steps: int = 80  # physics steps to let objects/arm settle after teleport
-    success_tol: float = 0.08  # forwarded into the sampled TaskSpec
+    success_tol: float = 0.06  # forwarded into the sampled TaskSpec
     seed: int | None = None
     dr: DomainRandomizationConfig = field(default_factory=DomainRandomizationConfig)  # M4 Layer B
 

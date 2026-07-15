@@ -158,7 +158,7 @@ def main() -> None:
     parser.add_argument("--max-seconds", type=float, default=15.0)
     parser.add_argument("--pick", nargs="+", default=["011_banana"], help="Object(s) to evaluate on.")
     parser.add_argument("--place", default="024_bowl")
-    parser.add_argument("--tol", type=float, default=0.08)
+    parser.add_argument("--tol", type=float, default=0.06)
     parser.add_argument("--no-task", action="store_true")
     parser.add_argument("--jitter", type=float, default=0.03)
     parser.add_argument(
