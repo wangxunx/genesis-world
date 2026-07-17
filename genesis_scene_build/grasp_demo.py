@@ -62,6 +62,16 @@ PALM_CLEARANCE = 0.02
 
 GRIPPER_OPEN = 0.04
 
+# Velocity limiting for GRASPED-object moves (lift + transport). The old approach commanded
+# the far IK setpoint immediately, which a stiff PD + high torque limit turns into a max-accel
+# dash -- the acceleration spike shakes/ejects the object from the gripper (verified with
+# motion_probe.py: transport EE accel ~22 m/s^2 and large in-gripper slip). Interpolating the
+# joint target one waypoint per control step caps the joint speed to MOVE_MAX_DQ / dt and
+# removes the spike (transport accel ~10 m/s^2, plum slip -77%) at ~no extra sim-step cost.
+MOVE_MAX_DQ = 0.006  # max per-control-step joint delta (rad); ~0.6 rad/s at 100 Hz
+MOVE_MIN_STEPS = 40  # floor so short grasped moves still ramp smoothly
+MOVE_SETTLE_STEPS = 15  # hold at the goal after arriving, to stabilize before the next phase
+
 MOTORS_DOF = np.arange(7)
 FINGERS_DOF = np.arange(7, 9)
 
@@ -230,6 +240,46 @@ def _goto_direct(bundle, pos, quat, *, finger_cmd, steps=120, close_force=None, 
     return qpos
 
 
+def _goto_interp(
+    bundle, pos, quat, *, finger_cmd, close_force=None,
+    max_dq=MOVE_MAX_DQ, min_steps=MOVE_MIN_STEPS, settle=MOVE_SETTLE_STEPS, recorder=None,
+):
+    """Velocity-limited move: linearly interpolate the arm joint target from the current
+    measured qpos to the IK goal, one waypoint per control step, then briefly hold.
+
+    Unlike ``_goto_direct`` (which commands the far setpoint immediately -> a max-accel dash
+    that shakes the grasped object loose), the per-step joint delta is capped to ``max_dq``
+    (i.e. joint speed to ``max_dq / dt``), giving a smooth, low-acceleration trajectory. The
+    number of waypoints scales with the move distance (floored at ``min_steps``), so short
+    moves still ramp smoothly and long moves stay gentle. Used for the grasped-object phases
+    (lift, transport). Fingers are force-controlled while ``close_force`` is given, else held
+    at ``finger_cmd`` -- matching ``_goto_direct``.
+    """
+    q_goal = _ik(bundle, pos, quat)
+    arm_goal = _to_numpy(q_goal[:-2])
+    arm_start = _to_numpy(bundle.franka.get_dofs_position(MOTORS_DOF))
+    dist = float(np.max(np.abs(arm_goal - arm_start))) if arm_goal.size else 0.0
+    n = max(min_steps, int(np.ceil(dist / max_dq))) if dist > 1e-9 else min_steps
+    finger_target = 0.0 if close_force is not None else finger_cmd
+
+    def _cmd(arm):
+        if recorder is not None:
+            recorder.on_step(np.concatenate([arm, [finger_target, finger_target]]))
+        bundle.franka.control_dofs_position(arm, MOTORS_DOF)
+        if close_force is not None:
+            bundle.franka.control_dofs_force(np.array([close_force, close_force]), FINGERS_DOF)
+        else:
+            bundle.franka.control_dofs_position(np.array([finger_cmd, finger_cmd]), FINGERS_DOF)
+        bundle.scene.step()
+        bundle.update_wrist_cam()
+
+    for i in range(1, n + 1):
+        _cmd(arm_start + (arm_goal - arm_start) * (i / n))
+    for _ in range(settle):
+        _cmd(arm_goal)
+    return q_goal
+
+
 def _descend_vertical(bundle, xy, z_from, z_to, quat, *, finger, steps=80, settle=15, recorder=None):
     """Descend straight down along a fixed xy by interpolating z and re-solving IK.
 
@@ -303,15 +353,17 @@ def run_pick_place(bundle, task: TaskSpec, *, save_frames: bool = False, recorde
     _goto_direct(bundle, grasp, grasp_quat, finger_cmd=0.0, steps=100, close_force=profile.close_force, recorder=recorder)
     snap("03_grasp")
 
-    # 4) Lift straight up from the grasp xy.
+    # 4) Lift straight up from the grasp xy. Velocity-limited (see _goto_interp): a gentle
+    # ramp instead of a max-accel dash keeps the object from shifting/ejecting in the jaws.
     lift = np.array([grasp[0], grasp[1], LIFT_HAND_Z])
-    _goto_direct(bundle, lift, grasp_quat, finger_cmd=0.0, steps=100, close_force=profile.close_force, recorder=recorder)
+    _goto_interp(bundle, lift, grasp_quat, finger_cmd=0.0, close_force=profile.close_force, recorder=recorder)
     snap("04_lift")
 
-    # 5) Move above the place target.
+    # 5) Move above the place target. Velocity-limited: this is the largest (lateral) move and
+    # the phase most prone to slinging a round/elongated object out of the gripper.
     place_xy, place_ref_z, _ = _resolve_place(bundle, task.place_target)
     above = np.array([place_xy[0], place_xy[1], place_ref_z + PLACE_HAND_Z_ABOVE_TARGET])
-    _goto_direct(bundle, above, grasp_quat, finger_cmd=0.0, steps=120, close_force=profile.close_force, recorder=recorder)
+    _goto_interp(bundle, above, grasp_quat, finger_cmd=0.0, close_force=profile.close_force, recorder=recorder)
     snap("05_above_target")
 
     # 6) Release the object.
