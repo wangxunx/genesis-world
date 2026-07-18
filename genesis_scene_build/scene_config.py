@@ -126,6 +126,27 @@ WRIST_CAM_LINK = "hand"
 # stay in view.
 WRIST_CAM_OFFSET_POS = (0.05, 0.0, -0.03)
 WRIST_CAM_OFFSET_EULER = (180.0, 0.0, 0.0)
+# Near clip plane for the wrist (eye-in-hand) camera. Genesis' add_camera defaults to
+# near=0.1 m, but a grasped object sits only a few cm in front of this camera, so the
+# default clips the object's near surface -- it renders "see-through", revealing the
+# table/bowl behind it. A small near plane keeps close-up grasped objects fully visible.
+# (Only the wrist camera needs this; the world/video cameras are always >0.1 m away.)
+WRIST_CAM_NEAR = 0.01
+WRIST_CAM_FAR = 20.0
+
+# Video camera: a purely cosmetic third-person view used only for saved eval videos
+# (never part of the policy observation / dataset). Placed off the -y long edge of the
+# table at the table's x-center, looking straight across toward the tabletop center: the
+# look direction lies in the y-z plane (zero x-component, i.e. perpendicular to the x
+# axis), giving a side elevation of the workspace along the table's longer edge.
+VIDEO_CAM_RES = (1280, 720)
+VIDEO_CAM_POS = (
+    TABLE_CENTER[0],
+    TABLE_CENTER[1] - 1.0,
+    TABLE_TOP_Z + 0.45,
+)
+VIDEO_CAM_LOOKAT = (TABLE_CENTER[0], TABLE_CENTER[1], TABLE_TOP_Z + 0.05)
+VIDEO_CAM_FOV = 42  # vertical FOV in degrees
 
 
 @dataclass(frozen=True)

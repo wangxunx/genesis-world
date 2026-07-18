@@ -221,6 +221,25 @@ def build_observation(bundle, pb: PolicyBundle) -> dict[str, np.ndarray]:
     return obs
 
 
+def _record_frame(bundle, pb: PolicyBundle, obs: dict[str, np.ndarray]) -> np.ndarray:
+    """Compose one saved-video frame as a 1x3 row: the policy's primary (world) camera,
+    the wrist (eye-in-hand) camera, and the cosmetic third-person ``video_cam`` -- side by
+    side, each resized to the primary panel's size. Cameras that are absent are skipped
+    (so this gracefully degrades to fewer panels). The wrist/video panels are only for
+    visualization; the video camera is never part of the observation fed to the policy.
+    """
+    primary = obs[pb.image_keys[0]]
+    h, w = primary.shape[:2]
+    panels = [primary]
+    if bundle.wrist_cam is not None:
+        panels.append(_render_camera(bundle.wrist_cam, (w, h)))
+    if bundle.video_cam is not None:
+        panels.append(_render_camera(bundle.video_cam, (w, h)))
+    if len(panels) == 1:
+        return primary.copy()
+    return np.ascontiguousarray(np.hstack(panels))
+
+
 def apply_action(bundle, action: np.ndarray, n_sim_steps: int) -> None:
     """Position-control the arm+gripper to the policy's target for ``n_sim_steps``."""
     action = np.asarray(action, dtype=np.float64).reshape(-1)
@@ -268,7 +287,7 @@ def run_episode(
     for _ in range(max_frames):
         obs = build_observation(bundle, pb)
         if record_video:
-            result.frames.append(obs[pb.image_keys[0]].copy())
+            result.frames.append(_record_frame(bundle, pb, obs))
 
         action = pb.select_action(obs, task_text)
 
@@ -296,7 +315,7 @@ def run_episode(
         for _ in range(hold_frames):
             apply_action(bundle, action, max(1, int(round(steps_per_frame))))
             obs = build_observation(bundle, pb)
-            result.frames.append(obs[pb.image_keys[0]].copy())
+            result.frames.append(_record_frame(bundle, pb, obs))
 
     return result
 
@@ -503,7 +522,11 @@ def main() -> None:
     parser.add_argument("--tol", type=float, default=0.06, help="Success tolerance (m).")
     parser.add_argument("--no-task", action="store_true", help="Send an empty task string (ignore language conditioning).")
     parser.add_argument("--jitter", type=float, default=0.03, help="Per-episode object position jitter (m).")
-    parser.add_argument("--save-video", action="store_true", help="Save the world-cam rollout of each episode to mp4.")
+    parser.add_argument(
+        "--save-video",
+        action="store_true",
+        help="Save each episode's rollout to mp4 (1x3: world + wrist + third-person view side by side).",
+    )
     parser.add_argument("--video-dir", default=None, help="Where to write rollout videos (default: eval_videos/<repo>).")
     parser.add_argument(
         "--results-out",
@@ -515,7 +538,10 @@ def main() -> None:
 
     repo_name = args.repo_id.split("/")[-1]
     gs.init(backend=gs.cpu if args.cpu else gs.gpu)
-    bundle = build_scene(show_viewer=args.vis, n_envs=1, add_world_cam=True, add_wrist_cam=True)
+    bundle = build_scene(
+        show_viewer=args.vis, n_envs=1, add_world_cam=True, add_wrist_cam=True,
+        add_video_cam=args.save_video,
+    )
 
     rename_map = json.loads(args.rename_map) if args.rename_map else None
     pb = load_policy(

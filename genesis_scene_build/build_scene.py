@@ -34,12 +34,18 @@ from scene_config import (
     TABLE_LEG_SIZE,
     TABLE_TOP_SIZE,
     TABLE_TOP_Z,
+    VIDEO_CAM_FOV,
+    VIDEO_CAM_LOOKAT,
+    VIDEO_CAM_POS,
+    VIDEO_CAM_RES,
     WORLD_CAM_FOV,
     WORLD_CAM_LOOKAT,
     WORLD_CAM_POS,
     WORLD_CAM_RES,
+    WRIST_CAM_FAR,
     WRIST_CAM_FOV,
     WRIST_CAM_LINK,
+    WRIST_CAM_NEAR,
     WRIST_CAM_OFFSET_EULER,
     WRIST_CAM_OFFSET_POS,
     WRIST_CAM_RES,
@@ -58,6 +64,8 @@ class SceneBundle:
     ycb: dict[str, gs.RigidEntity]
     world_cam: "gs.vis.camera.Camera | None" = None
     wrist_cam: "gs.vis.camera.Camera | None" = None
+    # Cosmetic third-person camera used only for saved eval videos (not an observation).
+    video_cam: "gs.vis.camera.Camera | None" = None
     # Static tabletop + leg entities. Kept so runtime DR (M4 Layer B) can scale table
     # friction: contact friction is max() over the pair, so the tabletop must be scaled
     # alongside the object for the effective object<->table friction to actually change.
@@ -76,6 +84,8 @@ class SceneBundle:
             out["world"] = self.world_cam.render(rgb=rgb, depth=depth)
         if self.wrist_cam is not None:
             out["wrist"] = self.wrist_cam.render(rgb=rgb, depth=depth)
+        if self.video_cam is not None:
+            out["video"] = self.video_cam.render(rgb=rgb, depth=depth)
         return out
 
 
@@ -176,6 +186,7 @@ def build_scene(
     n_envs: int = 1,
     add_world_cam: bool = True,
     add_wrist_cam: bool = True,
+    add_video_cam: bool = False,
     draw_world_frame: bool = False,
     scene_dr: "SceneDomainRandomizationConfig | None" = None,
 ) -> SceneBundle:
@@ -259,12 +270,27 @@ def build_scene(
             GUI=False,
         )
 
+    # Cosmetic recording view: a fixed third-person camera for saved eval videos only.
+    # Its FOV is jittered alongside the others under Layer-A DR purely for visual variety.
+    video_cam = None
+    if add_video_cam:
+        video_fov = VIDEO_CAM_FOV + (float(dr_rng.uniform(-dr_fov_amp, dr_fov_amp)) if dr_fov_amp else 0.0)
+        video_cam = scene.add_camera(
+            res=VIDEO_CAM_RES,
+            pos=VIDEO_CAM_POS,
+            lookat=VIDEO_CAM_LOOKAT,
+            fov=video_fov,
+            GUI=False,
+        )
+
     wrist_cam = None
     wrist_link = None
     if add_wrist_cam:
         wrist_cam = scene.add_camera(
             res=WRIST_CAM_RES,
             fov=wrist_fov,
+            near=WRIST_CAM_NEAR,
+            far=WRIST_CAM_FAR,
             GUI=False,
         )
         wrist_link = franka.get_link(WRIST_CAM_LINK)
@@ -295,6 +321,7 @@ def build_scene(
         ycb=ycb_entities,
         world_cam=world_cam,
         wrist_cam=wrist_cam,
+        video_cam=video_cam,
         table=table_entities,
         _wrist_link=wrist_link,
     )
